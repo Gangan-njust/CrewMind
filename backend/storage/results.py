@@ -21,6 +21,38 @@ from backend.tasks.definitions import TASK_FLOWS
 
 logger = logging.getLogger(__name__)
 
+TITLE_MAX_LENGTH = 80
+
+
+def generate_base_title(user_input: str, scenario: str) -> str:
+  line = user_input.strip().split("\n")[0].strip()
+  if not line:
+    try:
+      scenario_type = ScenarioType(scenario)
+      return SCENARIO_LABELS[scenario_type]
+    except ValueError:
+      return scenario or "工作方案"
+  if len(line) > TITLE_MAX_LENGTH:
+    return line[:TITLE_MAX_LENGTH].rstrip() + "..."
+  return line
+
+
+def make_unique_title(
+  session,
+  user_id: str,
+  base_title: str,
+  created_at: datetime,
+) -> str:
+  existing = session.scalars(
+    select(WorkflowRecord.title).where(
+      WorkflowRecord.user_id == user_id,
+      WorkflowRecord.title == base_title,
+    )
+  ).first()
+  if existing:
+    return f"{base_title} ({created_at.strftime('%Y-%m-%d %H:%M:%S')})"
+  return base_title
+
 
 class ResultStore:
   """结构化存储工作方案，支持历史检索与对比"""
@@ -49,13 +81,16 @@ class ResultStore:
     self._ensure_legacy_migrated()
     record_id = str(uuid.uuid4())
     created_at = datetime.now()
+    base_title = generate_base_title(user_input, scenario)
 
     with get_session() as session:
+      title = make_unique_title(session, user_id, base_title, created_at)
       session.add(WorkflowRecord(
         id=record_id,
         crew_id=crew_id,
         user_id=user_id,
         scenario=scenario,
+        title=title,
         user_input=user_input,
         created_at=created_at,
         metadata_json=json.dumps(metadata or {}, ensure_ascii=False),
@@ -66,7 +101,11 @@ class ResultStore:
     return record_id
 
   def list_records(
-    self, user_id: str, scenario: str | None = None, limit: int = 50
+    self,
+    user_id: str,
+    scenario: str | None = None,
+    search: str | None = None,
+    limit: int = 50,
   ) -> list[dict]:
     self._ensure_legacy_migrated()
     with get_session() as session:
@@ -77,6 +116,12 @@ class ResultStore:
       )
       if scenario:
         stmt = stmt.where(WorkflowRecord.scenario == scenario)
+      if search:
+        keyword = f"%{search.strip()}%"
+        stmt = stmt.where(
+          WorkflowRecord.title.ilike(keyword)
+          | WorkflowRecord.user_input.ilike(keyword)
+        )
       rows = session.scalars(stmt.limit(limit)).all()
       return [self._to_list_item(row) for row in rows]
 
@@ -135,6 +180,7 @@ class ResultStore:
     lines = [
       "# 工作方案",
       "",
+      f"- **标题**: {record.get('title', '')}",
       f"- **场景**: {scenario_label}",
       f"- **创建时间**: {created_display}",
       f"- **用户需求**: {record.get('user_input', '')}",
@@ -243,6 +289,10 @@ class ResultStore:
           crew_id=record.get("crew_id", ""),
           user_id=admin_id,
           scenario=record.get("scenario", ""),
+          title=record.get("title") or generate_base_title(
+            record.get("user_input", ""),
+            record.get("scenario", ""),
+          ),
           user_input=record.get("user_input", ""),
           created_at=created_at,
           metadata_json=json.dumps(record.get("metadata") or {}, ensure_ascii=False),
@@ -258,8 +308,10 @@ class ResultStore:
   @staticmethod
   def _to_list_item(row: WorkflowRecord) -> dict:
     tasks = json.loads(row.tasks_json or "{}")
+    title = row.title or generate_base_title(row.user_input, row.scenario)
     return {
       "id": row.id,
+      "title": title,
       "scenario": row.scenario,
       "user_input": row.user_input[:100],
       "created_at": row.created_at.isoformat(),
@@ -268,9 +320,11 @@ class ResultStore:
 
   @staticmethod
   def _to_record(row: WorkflowRecord) -> dict:
+    title = row.title or generate_base_title(row.user_input, row.scenario)
     return {
       "id": row.id,
       "crew_id": row.crew_id,
+      "title": title,
       "scenario": row.scenario,
       "user_input": row.user_input,
       "created_at": row.created_at.isoformat(),

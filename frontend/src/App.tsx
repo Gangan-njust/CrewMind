@@ -3,7 +3,7 @@ import {
   Play, Users, History, Bot, LayoutDashboard,
   CheckCircle, Clock, AlertTriangle, XCircle, Loader,
   Sun, Moon, Pause, FileText, FileDown, Upload, X,
-  Plus, Pencil, Trash2, Settings, LogOut, User,
+  Plus, Pencil, Trash2, Settings, LogOut, User, Search,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import {
@@ -1173,6 +1173,35 @@ function AgentsPage({ agents, onAgentsChange }: { agents: Agent[]; onAgentsChang
 /* ── History Page ───────────────────────────────────────────── */
 
 function HistoryPage({ history, selectedRecord, onSelect, onClose }: any) {
+  const [searchQuery, setSearchQuery] = useState('')
+  const [displayHistory, setDisplayHistory] = useState<HistoryRecord[]>(history)
+  const [searching, setSearching] = useState(false)
+
+  useEffect(() => {
+    if (!searchQuery.trim()) {
+      setDisplayHistory(history)
+    }
+  }, [history, searchQuery])
+
+  useEffect(() => {
+    const keyword = searchQuery.trim()
+    if (!keyword) return
+
+    const timer = setTimeout(async () => {
+      setSearching(true)
+      try {
+        const records = await fetchHistory(undefined, keyword)
+        setDisplayHistory(records)
+      } catch {
+        setDisplayHistory([])
+      } finally {
+        setSearching(false)
+      }
+    }, 300)
+
+    return () => clearTimeout(timer)
+  }, [searchQuery])
+
   if (selectedRecord) {
     return (
       <>
@@ -1184,7 +1213,7 @@ function HistoryPage({ history, selectedRecord, onSelect, onClose }: any) {
           </div>
         </div>
         <p className="page-desc">
-          {selectedRecord.scenario} · {new Date(selectedRecord.created_at).toLocaleString('zh-CN')}
+          {selectedRecord.title || selectedRecord.scenario} · {new Date(selectedRecord.created_at).toLocaleString('zh-CN')}
         </p>
         <div className="card" style={{ marginBottom: 16 }}>
           <div className="card-title">用户需求</div>
@@ -1212,20 +1241,35 @@ function HistoryPage({ history, selectedRecord, onSelect, onClose }: any) {
       <h2 className="page-title">历史方案</h2>
       <p className="page-desc">查看和管理过往的工作方案记录。</p>
 
-      {history.length === 0 ? (
+      <div className="history-search">
+        <Search size={18} className="history-search-icon" />
+        <input
+          className="form-input history-search-input"
+          type="search"
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          placeholder="搜索方案标题或需求描述..."
+        />
+        {searching && <Loader size={16} className="history-search-loading" />}
+      </div>
+
+      {displayHistory.length === 0 ? (
         <div className="empty-state">
           <History size={48} />
-          <p>暂无历史记录</p>
+          <p>{searchQuery.trim() ? '未找到匹配的方案' : '暂无历史记录'}</p>
         </div>
       ) : (
         <div className="history-list">
-          {history.map((record: HistoryRecord) => (
+          {displayHistory.map((record: HistoryRecord) => (
             <div key={record.id} className="history-item" onClick={() => onSelect(record.id)}>
               <div>
-                <div style={{ fontWeight: 500, fontSize: 14 }}>{record.user_input}</div>
+                <div style={{ fontWeight: 500, fontSize: 14 }}>{record.title}</div>
                 <div className="history-meta">
                   {record.scenario} · {record.task_count} 个任务 · {new Date(record.created_at).toLocaleString('zh-CN')}
                 </div>
+                {record.user_input && (
+                  <div className="history-preview">{record.user_input}</div>
+                )}
               </div>
               <span className="status-badge completed">查看</span>
             </div>

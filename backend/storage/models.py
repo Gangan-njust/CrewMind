@@ -25,6 +25,7 @@ class WorkflowRecord(Base):
     String(36), ForeignKey("users.id"), index=True, nullable=True
   )
   scenario: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+  title: Mapped[str] = mapped_column(String(256), index=True, nullable=False, default="")
   user_input: Mapped[str] = mapped_column(Text, nullable=False)
   created_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
   metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")

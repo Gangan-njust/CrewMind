@@ -423,6 +423,32 @@ body {
 }
 
 /* History */
+.history-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.history-search-icon {
+  position: absolute;
+  left: 12px;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.history-search-input {
+  padding-left: 40px;
+  padding-right: 40px;
+}
+
+.history-search-loading {
+  position: absolute;
+  right: 12px;
+  color: var(--text-muted);
+  animation: spin 1s linear infinite;
+}
+
 .history-list { display: flex; flex-direction: column; gap: 8px; }
 
 .history-item {
@@ -440,6 +466,16 @@ body {
 .history-item:hover { border-color: var(--accent); }
 
 .history-meta { font-size: 12px; color: var(--text-muted); }
+
+.history-preview {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 600px;
+}
 
 /* Agent info */
 .agent-grid {

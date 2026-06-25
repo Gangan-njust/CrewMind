@@ -398,10 +398,11 @@ async def resume_workflow(crew_id: str, current_user: User = Depends(get_current
 @app.get("/api/results")
 async def list_results(
   scenario: str | None = None,
+  search: str | None = None,
   limit: int = 50,
   current_user: User = Depends(get_current_user),
 ):
-  return result_store.list_records(current_user.id, scenario, limit)
+  return result_store.list_records(current_user.id, scenario, search, limit)
 
 
 @app.get("/api/results/{record_id}")

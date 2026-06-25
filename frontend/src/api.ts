@@ -68,6 +68,7 @@ export interface WorkflowStatus {
 
 export interface HistoryRecord {
   id: string
+  title: string
   scenario: string
   user_input: string
   created_at: string
@@ -242,9 +243,12 @@ export async function submitFeedback(
   return res.json()
 }
 
-export async function fetchHistory(scenario?: string): Promise<HistoryRecord[]> {
-  const params = scenario ? `?scenario=${scenario}` : ''
-  const res = await authFetch(`${API_BASE}/results${params}`)
+export async function fetchHistory(scenario?: string, search?: string): Promise<HistoryRecord[]> {
+  const params = new URLSearchParams()
+  if (scenario) params.set('scenario', scenario)
+  if (search) params.set('search', search)
+  const query = params.toString()
+  const res = await authFetch(`${API_BASE}/results${query ? `?${query}` : ''}`)
   if (!res.ok) throw new Error(await parseError(res, '加载历史失败'))
   return res.json()
 }

@@ -33,6 +33,14 @@ def run_migrations(engine) -> None:
       conn.execute(text("ALTER TABLE workflow_records ADD COLUMN user_id VARCHAR(36)"))
       logger.info("已为 workflow_records 添加 user_id 列")
 
+    if _table_exists(inspector, "workflow_records") and not _column_exists(
+      inspector, "workflow_records", "title"
+    ):
+      conn.execute(
+        text("ALTER TABLE workflow_records ADD COLUMN title VARCHAR(256) DEFAULT ''")
+      )
+      logger.info("已为 workflow_records 添加 title 列")
+
     if _table_exists(inspector, "custom_agents") and not _column_exists(
       inspector, "custom_agents", "user_id"
     ):
@@ -41,6 +49,7 @@ def run_migrations(engine) -> None:
 
   _ensure_admin_user()
   _migrate_existing_data_to_admin()
+  _backfill_workflow_titles()
 
 
 def _ensure_admin_user() -> User:
@@ -60,6 +69,34 @@ def _ensure_admin_user() -> User:
     session.refresh(admin)
     logger.info("已创建默认 admin 用户")
     return admin
+
+
+def _backfill_workflow_titles() -> None:
+  from backend.storage.results import generate_base_title
+
+  updated = 0
+  with get_session() as session:
+    rows = session.scalars(
+      select(WorkflowRecord)
+      .where(WorkflowRecord.title == "")
+      .order_by(WorkflowRecord.user_id, WorkflowRecord.created_at)
+    ).all()
+    if not rows:
+      return
+
+    seen_by_user: dict[str | None, set[str]] = {}
+    for row in rows:
+      base_title = generate_base_title(row.user_input, row.scenario)
+      seen = seen_by_user.setdefault(row.user_id, set())
+      title = base_title
+      if base_title in seen:
+        title = f"{base_title} ({row.created_at.strftime('%Y-%m-%d %H:%M:%S')})"
+      row.title = title
+      seen.add(base_title)
+      updated += 1
+
+    session.commit()
+    logger.info("已为 %d 条历史方案回填标题", updated)
 
 
 def _migrate_existing_data_to_admin() -> None:
