@@ -40,7 +40,7 @@ cp .env.example .env
 
 | 变量 | 说明 |
 |------|------|
-| `DEEPSEEK_API_KEY` | DeepSeek API 密钥（[获取地址](https://platform.deepseek.com/)） |
+| `DEEPSEEK_API_KEY` | DeepSeek API 密钥（[获取地址](https://platform.deepseek.com/)） ,目前只支持DeepSeek相关模型|
 | `JWT_SECRET` | 登录令牌密钥，**生产环境务必修改为随机字符串** |
 
 可选：`SEMANTIC_SCHOLAR_API_KEY` 可提高文献检索速率；`ADMIN_PASSWORD` 可修改默认管理员密码。
@@ -97,7 +97,7 @@ python run.py
 
 ```bash
 # 1. 克隆项目
-git clone <your-repo-url>
+git clone https://github.com/Gangan-njust/AgentCrew.git
 cd AgentCrew
 
 # 2. 配置环境变量
