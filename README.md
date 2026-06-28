@@ -284,7 +284,3 @@ pytest
 如需扩展工具、场景或 Agent 提示词，请参阅源码中 `backend/tools/`、`backend/tasks/definitions.py`、`backend/agents/roles.py` 等模块。
 
 ---
-
-## License
-
-请根据项目实际情况补充开源协议。
