@@ -31,6 +31,7 @@ from backend.crew.manager import workflow_manager
 from backend.storage.database import setup_database
 from backend.tasks.definitions import TaskStatus
 from backend.storage.results import result_store
+from backend.storage.templates import template_store
 from backend.storage.uploads import upload_store
 
 logging.basicConfig(level=settings.log_level)
@@ -73,6 +74,11 @@ class StartWorkflowRequest(BaseModel):
   user_input: str = Field(..., min_length=10, description="研究需求描述")
   reference_file_ids: list[str] = Field(default_factory=list, description="上传的参考文件 ID 列表")
   selected_agents: list[str] = Field(default_factory=list, description="参与协作的 Agent 角色 ID 列表")
+  topic_id: str | None = Field(None, description="关联课题 ID，用于在同一课题下生成新版本")
+  collaboration_mode: str = Field(
+    "sequential",
+    description="协作模式：sequential（串行）| debate（辩论）| voting（投票）",
+  )
 
 
 class AgentCreateRequest(BaseModel):
@@ -105,6 +111,10 @@ class CompareRequest(BaseModel):
   record_id_b: str
 
 
+class SetBestVersionRequest(BaseModel):
+  record_id: str
+
+
 class RegisterRequest(BaseModel):
   username: str = Field(..., min_length=3, max_length=64)
   password: str = Field(..., min_length=6, max_length=128)
@@ -113,6 +123,14 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
   username: str = Field(..., min_length=1)
   password: str = Field(..., min_length=1)
+
+
+class TemplateCreateRequest(BaseModel):
+  name: str = Field(..., min_length=1, max_length=128, description="模板名称")
+  description: str = Field("", max_length=512, description="模板说明")
+  scenario: str = Field(..., description="场景类型")
+  user_input: str = Field(..., min_length=10, description="需求描述（可用 {{变量名}} 标记待填项）")
+  selected_agents: list[str] = Field(default_factory=list, description="勾选的 Agent 列表")
 
 
 # ── WebSocket 连接管理 ─────────────────────────────────────────
@@ -165,6 +183,8 @@ async def _finalize_crew(crew) -> None:
       user_input=crew.user_input,
       user_id=crew.user_id,
       results=crew._serialize_results(),
+      topic_id=crew.topic_id,
+      metadata={"collaboration_mode": crew.collaboration_mode},
     )
 
 
@@ -282,14 +302,69 @@ async def upload_reference_file(
   }
 
 
+@app.get("/api/templates")
+async def list_templates(current_user: User = Depends(get_current_user)):
+  return template_store.list_templates(current_user.id)
+
+
+@app.get("/api/templates/{template_id}")
+async def get_template(template_id: str, current_user: User = Depends(get_current_user)):
+  tpl = template_store.get_template(template_id, current_user.id)
+  if not tpl:
+    raise HTTPException(404, "模板不存在")
+  return tpl
+
+
+@app.post("/api/templates")
+async def create_template(req: TemplateCreateRequest, current_user: User = Depends(get_current_user)):
+  try:
+    return template_store.create_template(
+      user_id=current_user.id,
+      name=req.name,
+      description=req.description,
+      scenario=req.scenario,
+      user_input=req.user_input,
+      selected_agents=req.selected_agents,
+    )
+  except ValueError as e:
+    raise HTTPException(400, str(e))
+
+
+@app.delete("/api/templates/{template_id}")
+async def delete_template(template_id: str, current_user: User = Depends(get_current_user)):
+  try:
+    template_store.delete_template(template_id, current_user.id)
+    return {"status": "deleted", "id": template_id}
+  except ValueError as e:
+    raise HTTPException(400, str(e))
+
+
+@app.get("/api/collaboration-modes")
+async def get_collaboration_modes(current_user: User = Depends(get_current_user)):
+  from backend.crew.collaboration import COLLABORATION_LABELS, CollaborationMode
+  return [
+    {"id": mode.value, "label": COLLABORATION_LABELS[mode]}
+    for mode in CollaborationMode
+  ]
+
+
 @app.post("/api/workflow/start")
 async def start_workflow(req: StartWorkflowRequest, current_user: User = Depends(get_current_user)):
+  from backend.crew.collaboration import CollaborationMode
+
+  try:
+    CollaborationMode(req.collaboration_mode)
+  except ValueError:
+    raise HTTPException(400, f"无效的协作模式: {req.collaboration_mode}")
+
   crew = await workflow_manager.start_workflow(
     scenario=req.scenario,
     user_input=req.user_input,
     user_id=current_user.id,
     reference_file_ids=req.reference_file_ids,
     selected_agents=req.selected_agents or None,
+    topic_id=req.topic_id,
+    collaboration_mode=req.collaboration_mode,
   )
 
   _attach_event_callback(crew)
@@ -307,6 +382,7 @@ async def start_workflow(req: StartWorkflowRequest, current_user: User = Depends
   return {
     "crew_id": crew.id,
     "scenario": crew.scenario,
+    "collaboration_mode": crew.collaboration_mode,
     "status": "started",
     "tasks": [
       {
@@ -329,6 +405,7 @@ async def get_workflow_status(crew_id: str, current_user: User = Depends(get_cur
   return {
     "crew_id": crew.id,
     "scenario": crew.scenario,
+    "collaboration_mode": crew.collaboration_mode,
     "status": crew.status,
     "user_input": crew.user_input,
     "results": crew._serialize_results(),
@@ -405,6 +482,44 @@ async def list_results(
   return result_store.list_records(current_user.id, scenario, search, limit)
 
 
+@app.get("/api/topics")
+async def list_topics(
+  scenario: str | None = None,
+  search: str | None = None,
+  limit: int = 50,
+  current_user: User = Depends(get_current_user),
+):
+  return result_store.list_topics(current_user.id, scenario, search, limit)
+
+
+@app.get("/api/topics/{topic_id}")
+async def get_topic(topic_id: str, current_user: User = Depends(get_current_user)):
+  topic = result_store.get_topic(topic_id, current_user.id)
+  if not topic:
+    raise HTTPException(404, "课题不存在")
+  return topic
+
+
+@app.get("/api/topics/{topic_id}/versions")
+async def list_topic_versions(topic_id: str, current_user: User = Depends(get_current_user)):
+  try:
+    return result_store.list_topic_versions(topic_id, current_user.id)
+  except ValueError as e:
+    raise HTTPException(404, str(e))
+
+
+@app.post("/api/topics/{topic_id}/best")
+async def set_best_version(
+  topic_id: str,
+  req: SetBestVersionRequest,
+  current_user: User = Depends(get_current_user),
+):
+  try:
+    return result_store.set_best_version(topic_id, req.record_id, current_user.id)
+  except ValueError as e:
+    raise HTTPException(400, str(e))
+
+
 @app.get("/api/results/{record_id}")
 async def get_result(record_id: str, current_user: User = Depends(get_current_user)):
   record = result_store.get(record_id, current_user.id)
@@ -416,23 +531,32 @@ async def get_result(record_id: str, current_user: User = Depends(get_current_us
 @app.get("/api/results/{record_id}/export")
 async def export_result(
   record_id: str,
-  format: str = Query("md", pattern="^(md|docx)$"),
+  format: str = Query("md", pattern="^(md|docx|tex)$"),
   current_user: User = Depends(get_current_user),
 ):
   record = result_store.get(record_id, current_user.id)
   if not record:
     raise HTTPException(404, "记录不存在")
 
-  md_content = result_store.build_markdown(record)
   filename = result_store.export_filename(record["scenario"], format)
 
   if format == "md":
+    md_content = result_store.build_markdown(record)
     return Response(
       content=md_content.encode("utf-8"),
       media_type="text/markdown; charset=utf-8",
       headers=_attachment_headers(filename),
     )
 
+  if format == "tex":
+    tex_content = result_store.build_latex(record)
+    return Response(
+      content=tex_content.encode("utf-8"),
+      media_type="application/x-tex; charset=utf-8",
+      headers=_attachment_headers(filename),
+    )
+
+  md_content = result_store.build_markdown(record)
   docx_bytes = result_store.build_docx(md_content)
   return Response(
     content=docx_bytes,
@@ -444,7 +568,7 @@ async def export_result(
 @app.get("/api/workflow/{crew_id}/export")
 async def export_workflow(
   crew_id: str,
-  format: str = Query("md", pattern="^(md|docx)$"),
+  format: str = Query("md", pattern="^(md|docx|tex)$"),
   current_user: User = Depends(get_current_user),
 ):
   crew = workflow_manager.get_crew(crew_id, current_user.id)
@@ -453,20 +577,37 @@ async def export_workflow(
   if crew.status not in ("completed", "failed"):
     raise HTTPException(400, "工作流尚未完成，暂无法导出")
 
-  md_content = result_store.build_markdown_from_workflow(
-    scenario=crew.scenario,
-    user_input=crew.user_input,
-    results=crew._serialize_results(),
-  )
   filename = result_store.export_filename(crew.scenario, format)
 
   if format == "md":
+    md_content = result_store.build_markdown_from_workflow(
+      scenario=crew.scenario,
+      user_input=crew.user_input,
+      results=crew._serialize_results(),
+    )
     return Response(
       content=md_content.encode("utf-8"),
       media_type="text/markdown; charset=utf-8",
       headers=_attachment_headers(filename),
     )
 
+  if format == "tex":
+    tex_content = result_store.build_latex_from_workflow(
+      scenario=crew.scenario,
+      user_input=crew.user_input,
+      results=crew._serialize_results(),
+    )
+    return Response(
+      content=tex_content.encode("utf-8"),
+      media_type="application/x-tex; charset=utf-8",
+      headers=_attachment_headers(filename),
+    )
+
+  md_content = result_store.build_markdown_from_workflow(
+    scenario=crew.scenario,
+    user_input=crew.user_input,
+    results=crew._serialize_results(),
+  )
   docx_bytes = result_store.build_docx(md_content)
   return Response(
     content=docx_bytes,
@@ -513,6 +654,7 @@ async def websocket_endpoint(crew_id: str, websocket: WebSocket, token: str = Qu
       "type": "status",
       "crew_id": crew_id,
       "status": crew.status,
+      "collaboration_mode": crew.collaboration_mode,
       "results": crew._serialize_results(),
     })
 

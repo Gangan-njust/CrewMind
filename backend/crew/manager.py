@@ -27,7 +27,12 @@ class WorkflowManager:
         "id": s.value,
         "label": SCENARIO_LABELS[s],
         "agents": [
-          {"id": aid, "name": registry[aid].name, "title": registry[aid].title}
+          {
+            "id": aid,
+            "name": registry[aid].name,
+            "title": registry[aid].title,
+            "category": registry[aid].category,
+          }
           for aid in SCENARIO_AGENTS[s]
           if aid in registry
         ],
@@ -55,29 +60,45 @@ class WorkflowManager:
     user_id: str,
     reference_file_ids: list[str] | None = None,
     selected_agents: list[str] | None = None,
+    topic_id: str | None = None,
+    collaboration_mode: str = "sequential",
     event_callback=None,
   ) -> Crew:
+    from backend.crew.collaboration import (
+      CollaborationMode,
+      get_debate_tasks,
+      get_voting_tasks,
+    )
+
     scenario_type = ScenarioType(scenario)
-    tasks = list(TASK_FLOWS[scenario_type])
+    mode = CollaborationMode(collaboration_mode)
+
+    if mode == CollaborationMode.DEBATE:
+      tasks = get_debate_tasks()
+    elif mode == CollaborationMode.VOTING:
+      tasks = get_voting_tasks()
+    else:
+      tasks = list(TASK_FLOWS[scenario_type])
+      if selected_agents:
+        unknown = [aid for aid in selected_agents if aid not in get_agent_registry(user_id)]
+        if unknown:
+          raise ValueError(f"未知 Agent 角色: {', '.join(unknown)}")
+        tasks = filter_tasks_by_agents(tasks, selected_agents)
+        if not tasks:
+          raise ValueError("所选 Agent 角色无法组成有效任务流程，请至少保留一个相关角色")
+
     registry = get_agent_registry(user_id)
-
-    if selected_agents:
-      unknown = [aid for aid in selected_agents if aid not in registry]
-      if unknown:
-        raise ValueError(f"未知 Agent 角色: {', '.join(unknown)}")
-      tasks = filter_tasks_by_agents(tasks, selected_agents)
-      if not tasks:
-        raise ValueError("所选 Agent 角色无法组成有效任务流程，请至少保留一个相关角色")
-
     reference_files = upload_store.resolve_paths(reference_file_ids or [])
 
     crew = Crew(
       scenario=scenario,
       user_input=user_input,
       user_id=user_id,
+      topic_id=topic_id,
       reference_files=reference_files,
       tasks=tasks,
       agent_registry=registry,
+      collaboration_mode=mode.value,
       _event_callback=event_callback,
     )
     self._active_crews[crew.id] = crew
@@ -110,6 +131,8 @@ class WorkflowManager:
         user_input=crew.user_input,
         user_id=crew.user_id,
         results=crew._serialize_results(),
+        topic_id=crew.topic_id,
+        metadata={"collaboration_mode": crew.collaboration_mode},
       )
       return {"status": crew.status, "record_id": record_id, "results": crew._serialize_results()}
     return {"status": crew.status, "results": crew._serialize_results()}

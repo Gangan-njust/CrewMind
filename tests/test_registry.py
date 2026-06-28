@@ -21,7 +21,9 @@ def mock_tools():
   file_parser.run_for_files = AsyncMock(return_value="### 文件: notes.md\n\n参考内容")
 
   web_search = AsyncMock()
-  web_search.run = AsyncMock(return_value='[{"title": "Mock Paper", "source": "Test"}]')
+  web_search.run = AsyncMock(
+    return_value='{"databases_used": ["Semantic Scholar"], "query": "test", "papers": [{"title": "Mock Paper", "source": "Test"}]}'
+  )
 
   code_interpreter = AsyncMock()
   code_interpreter.run_for_experiment_context = AsyncMock(

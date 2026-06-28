@@ -113,9 +113,10 @@ class TestPubMedFallback:
         result = await tool.run(query="medical diagnosis deep learning")
 
     parsed = json.loads(result)
-    assert isinstance(parsed, list)
-    assert parsed[0]["source"] == "PubMed"
-    assert parsed[0]["title"] == "Deep Learning for Medical Diagnosis"
+    assert isinstance(parsed, dict)
+    assert parsed["databases_used"] == ["PubMed"]
+    assert parsed["papers"][0]["source"] == "PubMed"
+    assert parsed["papers"][0]["title"] == "Deep Learning for Medical Diagnosis"
 
   @pytest.mark.asyncio
   async def test_falls_back_on_semantic_scholar_failure(self, sample_pubmed_xml):

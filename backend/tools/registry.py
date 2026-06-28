@@ -1,7 +1,9 @@
 """统一工具注册与 Agent 工具调度"""
+import json
 import logging
 from typing import Any, Callable, Awaitable
 
+from backend.agents.citations import format_citation_instruction
 from backend.agents.roles import AgentRole
 from backend.tools.code_interpreter import CodeInterpreterTool
 from backend.tools.file_parser import FileParserTool
@@ -67,13 +69,26 @@ async def run_agent_tools(
         await _emit("web_search", "started", f"检索: {query[:80]}")
         try:
           search_result = await search_tool.run(query=query)
-          source_hint = "Semantic Scholar / PubMed"
+          databases_used: list[str] = []
+          try:
+            parsed = json.loads(search_result)
+            if isinstance(parsed, dict):
+              databases_used = list(parsed.get("databases_used") or [])
+          except json.JSONDecodeError:
+            pass
+          source_hint = (
+            "、".join(databases_used) if databases_used else "Semantic Scholar / PubMed"
+          )
           await _emit("web_search", "completed", f"检索完成 ({source_hint})")
+          citation_hint = format_citation_instruction(databases_used or None)
           messages.append({
             "role": "user",
             "content": (
-              f"## 学术文献检索结果（{source_hint}）\n\n"
-              f"检索词: {query}\n\n{search_result}"
+              f"## 学术文献检索结果\n\n"
+              f"检索数据库: {source_hint}\n"
+              f"检索词: {query}\n\n"
+              f"{search_result}\n\n"
+              f"{citation_hint}"
             ),
           })
         except Exception as e:

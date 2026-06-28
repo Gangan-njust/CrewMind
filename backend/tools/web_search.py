@@ -23,25 +23,36 @@ class WebSearchTool(BaseTool):
     if not query:
       return "错误：请提供搜索关键词"
 
+    databases_used: list[str] = []
     results: list[dict[str, Any]] = []
     try:
       results = await self._search_semantic_scholar(query, max_results)
+      if results:
+        databases_used.append("Semantic Scholar")
     except Exception as e:
       logger.warning("Semantic Scholar 检索失败: %s", e)
 
     if not results:
       try:
         results = await self._search_pubmed(query, max_results)
+        if results:
+          databases_used.append("PubMed")
       except Exception as e:
         logger.warning("PubMed 检索失败: %s", e)
 
     if not results:
       return (
         f"未找到与「{query}」直接相关的文献。"
-        "请基于领域知识撰写，并明确标注需人工补充引用的部分。"
+        "请基于领域知识撰写，并明确标注需人工补充引用的部分；"
+        "文末仍须包含「参考文献」与「文献数据库说明」章节。"
       )
 
-    return json.dumps(results, ensure_ascii=False, indent=2)
+    payload = {
+      "databases_used": databases_used,
+      "query": query,
+      "papers": results,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
   async def _search_semantic_scholar(self, query: str, limit: int) -> list[dict[str, Any]]:
     headers: dict[str, str] = {}

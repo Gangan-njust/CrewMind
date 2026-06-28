@@ -49,7 +49,7 @@ class TestAgentRegistry:
   def test_builtin_agents_present(self, test_user_id):
     agents = list_agents(test_user_id)
     builtin = [a for a in agents if a["is_builtin"]]
-    assert len(builtin) == 5
+    assert len(builtin) == 8
     assert any(a["id"] == "planner" for a in builtin)
 
   def test_create_and_delete_custom_agent(self, test_user_id):

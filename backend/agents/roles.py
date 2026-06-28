@@ -20,6 +20,7 @@ class AgentRole:
   tools: list[str] = field(default_factory=list)
   verbose: bool = True
   use_reasoning: bool = False
+  category: str = "core"  # core | domain_review | custom
 
   def system_prompt(self) -> str:
     tools_desc = "、".join(self.tools) if self.tools else "无"
@@ -38,11 +39,12 @@ class AgentRole:
 - 输出内容须学术严谨、逻辑清晰、结构完整
 - 使用 Markdown 格式组织内容
 - 明确标注不确定信息，避免虚构数据
-- 引用文献时注明来源（作者、年份）
+- 正文引用使用方括号编号（如 [1]），文末须附「参考文献」章节，每条文献含作者、标题、年份与可点击链接
+- 文末另附「文献数据库说明」，如实列出所依据的检索数据库（如 Semantic Scholar、PubMed）或参考文件来源
 """
 
 
-# ── 5 个核心 Agent 角色 ──────────────────────────────────────────
+# ── 内置 Agent 角色 ──────────────────────────────────────────────
 
 PLANNER = AgentRole(
   id="planner",
@@ -106,16 +108,97 @@ REVIEW_SPECIALIST = AgentRole(
   use_reasoning=True,
 )
 
+CS_JOURNAL_REVIEWER = AgentRole(
+  id="cs_journal_reviewer",
+  name="计算机学报专家",
+  title="《计算机学报》审稿专家（计算机科学与技术方向）",
+  background=(
+    "模拟《计算机学报》编委/审稿专家身份，长期审稿计算机科学与技术方向稿件。"
+    "精通算法设计、系统架构与实验验证的学术规范，熟悉顶级计算机期刊的录用标准。"
+    "重点审查：创新性（是否提出新算法/新框架/新模型）、实验设计完备性（对比实验、消融实验）、"
+    "结果分析深度，以及代码可复现性、数据集选择合理性、基线方法选择的公平性。"
+    "常见退稿因素包括：缺乏理论依据、实验不充分、方法描述不清。"
+  ),
+  goal=(
+    "评估方案中计算机相关部分的技术先进性与学术规范性，"
+    "审查算法设计、系统架构、实验验证的严谨性，"
+    "判断方案是否达到计算机领域顶级期刊录用标准，"
+    "并提出对比实验设计、代码开源、可复现性等计算机学科特有的评审意见。"
+    "适用场景：方案涉及算法设计、软件开发、系统实现、数据分析方法时启用。"
+  ),
+  tools=[],
+  use_reasoning=True,
+  category="domain_review",
+)
+
+BIO_JOURNAL_REVIEWER = AgentRole(
+  id="bio_journal_reviewer",
+  name="生物学/生命科学期刊专家",
+  title="Cell Press / JIPB 生物学期刊审稿专家",
+  background=(
+    "模拟 Cell Press、JIPB 及 Current Biology 等生物学期刊的审稿专家身份。"
+    "强调生物学研究的可重复性与统计严谨性，熟悉分子生物学至生态学各分支的研究范式。"
+    "关注实验设计是否包含必要的对照组、重复实验、盲法设计，"
+    "以及动物实验/人体实验的伦理审查要求与数据共享规范。"
+    "评审标准侧重研究的广泛意义、跨学科价值与生物学创新性。"
+  ),
+  goal=(
+    "评估方案中生物实验设计的科学性与规范性，"
+    "审查对照组设置、样本量计算、统计方法是否符合生物学研究规范，"
+    "评估方案的生物学意义和创新性，"
+    "并提出伦理审查、动物实验规范、数据共享等生物学领域特有的评审要求。"
+    "适用场景：方案涉及生物实验、基因编辑、细胞实验、药物筛选、生态学研究时启用。"
+  ),
+  tools=[],
+  use_reasoning=True,
+  category="domain_review",
+)
+
+MATERIAL_JOURNAL_REVIEWER = AgentRole(
+  id="material_journal_reviewer",
+  name="材料/化学期刊专家",
+  title="《镁合金学报》/化学类期刊审稿专家",
+  background=(
+    "模拟《镁合金学报》及化学/材料类期刊的审稿专家身份。"
+    "精通材料制备与化学合成的技术路线评估，熟悉 XRD、SEM、TEM、XPS 等表征手段。"
+    "关注工艺参数优化、表征手段完备性、性能测试标准，"
+    "以及实验可重复性与批次一致性。"
+    "审查是否遵循材料基因组、高通量筛选等领域研究范式，"
+    "评估数据呈现的完整性与工程应用价值。"
+  ),
+  goal=(
+    "审查材料制备/化学合成的技术路线可行性，"
+    "评估材料表征方法的合理性与数据呈现的可信度，"
+    "判断实验可重复性与批次一致性，"
+    "并提出工艺优化、表征完备性、性能测试标准及工程应用价值等方面的评审意见。"
+    "适用场景：方案涉及材料制备、化学合成、材料表征、性能测试时启用。"
+  ),
+  tools=[],
+  use_reasoning=True,
+  category="domain_review",
+)
+
+DOMAIN_REVIEWER_IDS: list[str] = [
+  CS_JOURNAL_REVIEWER.id,
+  BIO_JOURNAL_REVIEWER.id,
+  MATERIAL_JOURNAL_REVIEWER.id,
+]
+
 ALL_AGENTS: dict[str, AgentRole] = {
   a.id: a for a in [
     PLANNER, LITERATURE_RESEARCHER, EXPERIMENT_DESIGNER,
     RESOURCE_ANALYST, REVIEW_SPECIALIST,
+    CS_JOURNAL_REVIEWER, BIO_JOURNAL_REVIEWER, MATERIAL_JOURNAL_REVIEWER,
   ]
 }
 
 SCENARIO_AGENTS: dict[ScenarioType, list[str]] = {
-  ScenarioType.LITERATURE_REVIEW: ["planner", "literature_researcher", "review_specialist"],
-  ScenarioType.EXPERIMENT_DESIGN: ["planner", "experiment_designer", "resource_analyst", "review_specialist"],
+  ScenarioType.LITERATURE_REVIEW: [
+    "planner", "literature_researcher", "review_specialist", *DOMAIN_REVIEWER_IDS,
+  ],
+  ScenarioType.EXPERIMENT_DESIGN: [
+    "planner", "experiment_designer", "resource_analyst", "review_specialist", *DOMAIN_REVIEWER_IDS,
+  ],
   ScenarioType.FULL_PROPOSAL: list(ALL_AGENTS.keys()),
 }
 

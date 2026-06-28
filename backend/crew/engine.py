@@ -28,6 +28,7 @@ class TaskResult:
   started_at: datetime | None = None
   completed_at: datetime | None = None
   human_feedback: str = ""
+  metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -42,6 +43,7 @@ class Agent:
     context_outputs: dict[str, str] | None = None,
     human_feedback: str = "",
     partial_output: str = "",
+    revision_base: str = "",
     user_input: str = "",
     reference_files: list[str] | None = None,
     on_chunk: Callable[[str], Awaitable[None]] | None = None,
@@ -51,7 +53,7 @@ class Agent:
     messages = [{"role": "system", "content": self.role.system_prompt()}]
 
     user_content = task_prompt
-    if human_feedback:
+    if human_feedback and not revision_base:
       user_content += f"\n\n## 人工审核反馈\n\n请根据以下反馈意见修改和完善你的输出：\n{human_feedback}"
 
     messages.append({"role": "user", "content": user_content})
@@ -67,7 +69,17 @@ class Agent:
     )
     messages.extend(tool_messages)
 
-    if partial_output:
+    if revision_base and human_feedback:
+      messages.append({"role": "assistant", "content": revision_base})
+      messages.append({
+        "role": "user",
+        "content": (
+          "以上是你在上一阶段的输出。请根据以下人工审核意见进行修改和完善，"
+          "输出修改后的完整内容（不要只输出修改部分，不要重复解释修改过程）：\n\n"
+          f"{human_feedback}"
+        ),
+      })
+    elif partial_output:
       messages.append({"role": "assistant", "content": partial_output})
       messages.append({
         "role": "user",
@@ -102,15 +114,24 @@ class Crew:
   scenario: str = ""
   user_input: str = ""
   user_id: str = ""
+  topic_id: str | None = None
   reference_files: list[str] = field(default_factory=list)
   tasks: list[TaskDefinition] = field(default_factory=list)
   agent_registry: dict[str, AgentRole] = field(default_factory=dict)
   results: dict[str, TaskResult] = field(default_factory=dict)
+  collaboration_mode: str = "sequential"
   status: str = "idle"  # idle | running | paused | suspended | completed | failed
   _event_callback: EventCallback | None = field(default=None, repr=False)
   _human_feedback_queue: dict[str, str] = field(default_factory=dict, repr=False)
   _user_pause_requested: bool = field(default=False, repr=False)
   _suspended_task_id: str | None = field(default=None, repr=False)
+  _debate_history: list[dict[str, Any]] = field(default_factory=list, repr=False)
+  _debate_round: int = field(default=0, repr=False)
+  _debate_phase: str = field(default="init", repr=False)
+  _debate_checkpoint: str = field(default="", repr=False)
+  _current_proposal: str = field(default="", repr=False)
+  _voting_solver_outputs: dict[str, str] = field(default_factory=dict, repr=False)
+  _voting_phase: str = field(default="solvers", repr=False)
 
   def _resolve_agent(self, agent_id: str) -> AgentRole | None:
     if self.agent_registry:
@@ -130,14 +151,16 @@ class Crew:
     task_context: dict[str, str],
     feedback: str = "",
     partial_output: str = "",
+    revision_base: str = "",
   ) -> str:
     """执行 Agent 并通过 WebSocket 流式推送输出片段"""
     if self._user_pause_requested:
       raise CrewSuspended()
 
     result = self.results.get(task_id)
-    if not partial_output and result:
-      result.output = ""
+    if result:
+      if revision_base or not partial_output:
+        result.output = ""
 
     async def on_chunk(chunk: str) -> None:
       if self._user_pause_requested:
@@ -159,6 +182,7 @@ class Crew:
       task_context,
       feedback,
       partial_output=partial_output,
+      revision_base=revision_base,
       user_input=self.user_input,
       reference_files=self.reference_files,
       on_chunk=on_chunk,
@@ -185,6 +209,15 @@ class Crew:
       "output": result.output if result else "",
     })
 
+  def _init_task_result(self, task_id: str, task_name: str, agent_id: str) -> TaskResult:
+    result = TaskResult(
+      task_id=task_id,
+      status=TaskStatus.RUNNING,
+      started_at=datetime.now(),
+    )
+    self.results[task_id] = result
+    return result
+
   async def resume_execution(self) -> dict[str, TaskResult]:
     """从中止状态继续执行"""
     if self.status != "suspended":
@@ -192,22 +225,45 @@ class Crew:
     if not self._suspended_task_id:
       raise ValueError("无法确定恢复点")
 
-    start_idx = next(
-      (i for i, t in enumerate(self.tasks) if t.id == self._suspended_task_id),
-      None,
-    )
-    if start_idx is None:
-      raise ValueError(f"恢复任务不存在: {self._suspended_task_id}")
-
+    suspended_task_id = self._suspended_task_id
     self._suspended_task_id = None
     self.status = "running"
     await self._emit("crew_resumed", {"crew_id": self.id})
+
+    if self.collaboration_mode == "debate":
+      from backend.crew.debate import run_debate
+      return await run_debate(self, resume=True)
+
+    if self.collaboration_mode == "voting":
+      from backend.crew.voting import run_voting
+      return await run_voting(self, resume=True)
+
+    start_idx = next(
+      (i for i, t in enumerate(self.tasks) if t.id == suspended_task_id),
+      None,
+    )
+    if start_idx is None:
+      raise ValueError(f"恢复任务不存在: {suspended_task_id}")
+
     return await self._execute_from_index(start_idx)
 
   async def run(self) -> dict[str, TaskResult]:
-    """按依赖顺序执行任务流程"""
+    """按协作模式执行任务流程"""
     self.status = "running"
-    await self._emit("crew_started", {"crew_id": self.id, "scenario": self.scenario})
+    await self._emit("crew_started", {
+      "crew_id": self.id,
+      "scenario": self.scenario,
+      "collaboration_mode": self.collaboration_mode,
+    })
+
+    if self.collaboration_mode == "debate":
+      from backend.crew.debate import run_debate
+      return await run_debate(self)
+
+    if self.collaboration_mode == "voting":
+      from backend.crew.voting import run_voting
+      return await run_voting(self)
+
     return await self._execute_from_index(0)
 
   async def _execute_from_index(self, start_idx: int) -> dict[str, TaskResult]:
@@ -353,9 +409,11 @@ class Crew:
             if dep in self.results
           }
           prompt = task_def.build_prompt(self.user_input, context)
+          original_output = result.output
           try:
             result.output = await self._execute_agent(
               task_id, agent, prompt, context, feedback,
+              revision_base=original_output,
             )
             result.completed_at = datetime.now()
           except CrewSuspended:
@@ -385,12 +443,15 @@ class Crew:
     await self._emit("task_failed", {"task_id": task_id, "error": error})
 
   def _serialize_results(self) -> dict:
-    return {
-      tid: {
+    serialized: dict[str, dict[str, Any]] = {}
+    for tid, r in self.results.items():
+      entry: dict[str, Any] = {
         "status": r.status.value,
         "output": r.output,
         "error": r.error,
         "human_feedback": r.human_feedback,
       }
-      for tid, r in self.results.items()
-    }
+      if r.metadata:
+        entry["metadata"] = r.metadata
+      serialized[tid] = entry
+    return serialized

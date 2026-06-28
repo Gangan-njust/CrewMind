@@ -1,7 +1,10 @@
 """步骤11：结果管理与历史方案库"""
+import difflib
+import hashlib
 import io
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -11,17 +14,146 @@ from docx import Document
 from docx.oxml.ns import qn
 from docx.shared import Pt
 from htmldocx import HtmlToDocx
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from backend.agents.roles import SCENARIO_LABELS, ScenarioType
 from backend.config import PROJECT_ROOT, settings
 from backend.storage.database import get_session, setup_database
-from backend.storage.models import WorkflowRecord
+from backend.storage.models import TopicRecord, WorkflowRecord
 from backend.tasks.definitions import TASK_FLOWS
 
 logger = logging.getLogger(__name__)
 
 TITLE_MAX_LENGTH = 80
+
+_LATEX_ESCAPES = (
+  ("\\", r"\textbackslash{}"),
+  ("&", r"\&"),
+  ("%", r"\%"),
+  ("$", r"\$"),
+  ("#", r"\#"),
+  ("_", r"\_"),
+  ("{", r"\{"),
+  ("}", r"\}"),
+  ("~", r"\textasciitilde{}"),
+  ("^", r"\textasciicircum{}"),
+)
+
+
+def _escape_latex(text: str) -> str:
+  for char, repl in _LATEX_ESCAPES:
+    text = text.replace(char, repl)
+  return text
+
+
+def _inline_markdown_to_latex(text: str) -> str:
+  pattern = re.compile(r"(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|[^*`]+)")
+  parts: list[str] = []
+  for match in pattern.finditer(text):
+    chunk = match.group(0)
+    if chunk.startswith("`") and chunk.endswith("`"):
+      parts.append(rf"\texttt{{{_escape_latex(chunk[1:-1])}}}")
+    elif chunk.startswith("**") and chunk.endswith("**"):
+      parts.append(rf"\textbf{{{_escape_latex(chunk[2:-2])}}}")
+    elif chunk.startswith("*") and chunk.endswith("*"):
+      parts.append(rf"\textit{{{_escape_latex(chunk[1:-1])}}}")
+    else:
+      parts.append(_escape_latex(chunk))
+  return "".join(parts)
+
+
+def _markdown_to_latex(md: str) -> str:
+  if not md.strip():
+    return ""
+
+  lines = md.splitlines()
+  parts: list[str] = []
+  in_verbatim = False
+  list_active = False
+  i = 0
+
+  def close_list() -> None:
+    nonlocal list_active
+    if list_active:
+      parts.append(r"\end{itemize}")
+      list_active = False
+
+  while i < len(lines):
+    line = lines[i]
+
+    if line.strip().startswith("```"):
+      if in_verbatim:
+        parts.append(r"\end{verbatim}")
+        in_verbatim = False
+      else:
+        close_list()
+        parts.append(r"\begin{verbatim}")
+        in_verbatim = True
+      i += 1
+      continue
+
+    if in_verbatim:
+      parts.append(line)
+      i += 1
+      continue
+
+    stripped = line.strip()
+
+    header = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+    if header:
+      close_list()
+      level = len(header.group(1))
+      title = _inline_markdown_to_latex(header.group(2))
+      if level == 1:
+        parts.append(rf"\section{{{title}}}")
+      elif level == 2:
+        parts.append(rf"\subsection{{{title}}}")
+      elif level == 3:
+        parts.append(rf"\subsubsection{{{title}}}")
+      else:
+        parts.append(rf"\paragraph{{{title}}}\mbox{{}}")
+      i += 1
+      continue
+
+    list_item = re.match(r"^[-*+]\s+(.*)$", stripped)
+    if list_item:
+      if not list_active:
+        parts.append(r"\begin{itemize}")
+        list_active = True
+      parts.append(rf"\item {_inline_markdown_to_latex(list_item.group(1))}")
+      i += 1
+      continue
+
+    if re.match(r"^---+$", stripped):
+      close_list()
+      parts.append(r"\noindent\rule{\textwidth}{0.4pt}")
+      i += 1
+      continue
+
+    if not stripped:
+      close_list()
+      parts.append("")
+      i += 1
+      continue
+
+    close_list()
+    parts.append(_inline_markdown_to_latex(stripped))
+    parts.append("")
+    i += 1
+
+  close_list()
+  if in_verbatim:
+    parts.append(r"\end{verbatim}")
+  return "\n".join(parts).strip()
+
+
+def normalize_user_input(text: str) -> str:
+  return re.sub(r"\s+", " ", text.strip()).lower()
+
+
+def compute_topic_key(user_input: str, scenario: str) -> str:
+  raw = f"{scenario}::{normalize_user_input(user_input)}"
+  return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
 def generate_base_title(user_input: str, scenario: str) -> str:
@@ -76,6 +208,7 @@ class ResultStore:
     results: dict,
     user_id: str,
     metadata: dict | None = None,
+    topic_id: str | None = None,
   ) -> str:
     """保存工作方案，返回记录 ID"""
     self._ensure_legacy_migrated()
@@ -84,11 +217,18 @@ class ResultStore:
     base_title = generate_base_title(user_input, scenario)
 
     with get_session() as session:
-      title = make_unique_title(session, user_id, base_title, created_at)
+      topic = self._resolve_topic(
+        session, user_id, scenario, user_input, topic_id, base_title, created_at
+      )
+      version_number = self._next_version_number(session, topic.id)
+      title = f"{topic.title} · v{version_number}"
+
       session.add(WorkflowRecord(
         id=record_id,
         crew_id=crew_id,
         user_id=user_id,
+        topic_id=topic.id,
+        version_number=version_number,
         scenario=scenario,
         title=title,
         user_input=user_input,
@@ -96,9 +236,137 @@ class ResultStore:
         metadata_json=json.dumps(metadata or {}, ensure_ascii=False),
         tasks_json=json.dumps(results, ensure_ascii=False),
       ))
+      topic.updated_at = created_at
       session.commit()
 
     return record_id
+
+  def _resolve_topic(
+    self,
+    session,
+    user_id: str,
+    scenario: str,
+    user_input: str,
+    topic_id: str | None,
+    base_title: str,
+    created_at: datetime,
+  ) -> TopicRecord:
+    if topic_id:
+      topic = session.get(TopicRecord, topic_id)
+      if not topic or topic.user_id != user_id:
+        raise ValueError("课题不存在")
+      return topic
+
+    topic_key = compute_topic_key(user_input, scenario)
+    topic = session.scalars(
+      select(TopicRecord).where(
+        TopicRecord.user_id == user_id,
+        TopicRecord.topic_key == topic_key,
+      )
+    ).first()
+    if topic:
+      return topic
+
+    topic = TopicRecord(
+      id=str(uuid.uuid4()),
+      user_id=user_id,
+      scenario=scenario,
+      title=base_title,
+      topic_key=topic_key,
+      user_input=user_input,
+      best_record_id=None,
+      created_at=created_at,
+      updated_at=created_at,
+    )
+    session.add(topic)
+    session.flush()
+    return topic
+
+  @staticmethod
+  def _next_version_number(session, topic_id: str) -> int:
+    current = session.scalar(
+      select(func.max(WorkflowRecord.version_number)).where(
+        WorkflowRecord.topic_id == topic_id
+      )
+    )
+    return (current or 0) + 1
+
+  def list_topics(
+    self,
+    user_id: str,
+    scenario: str | None = None,
+    search: str | None = None,
+    limit: int = 50,
+  ) -> list[dict]:
+    self._ensure_legacy_migrated()
+    with get_session() as session:
+      stmt = (
+        select(TopicRecord)
+        .where(TopicRecord.user_id == user_id)
+        .order_by(TopicRecord.updated_at.desc())
+      )
+      if scenario:
+        stmt = stmt.where(TopicRecord.scenario == scenario)
+      if search:
+        keyword = f"%{search.strip()}%"
+        stmt = stmt.where(
+          TopicRecord.title.ilike(keyword) | TopicRecord.user_input.ilike(keyword)
+        )
+      topics = session.scalars(stmt.limit(limit)).all()
+      result = []
+      for topic in topics:
+        version_count = session.scalar(
+          select(func.count()).select_from(WorkflowRecord).where(
+            WorkflowRecord.topic_id == topic.id
+          )
+        ) or 0
+        result.append(self._to_topic_item(topic, version_count))
+      return result
+
+  def list_topic_versions(self, topic_id: str, user_id: str) -> list[dict]:
+    self._ensure_legacy_migrated()
+    with get_session() as session:
+      topic = session.get(TopicRecord, topic_id)
+      if not topic or topic.user_id != user_id:
+        raise ValueError("课题不存在")
+      rows = session.scalars(
+        select(WorkflowRecord)
+        .where(WorkflowRecord.topic_id == topic_id)
+        .order_by(WorkflowRecord.version_number.desc())
+      ).all()
+      return [self._to_version_item(row, topic.best_record_id) for row in rows]
+
+  def get_topic(self, topic_id: str, user_id: str) -> dict | None:
+    self._ensure_legacy_migrated()
+    with get_session() as session:
+      topic = session.get(TopicRecord, topic_id)
+      if not topic or topic.user_id != user_id:
+        return None
+      version_count = session.scalar(
+        select(func.count()).select_from(WorkflowRecord).where(
+          WorkflowRecord.topic_id == topic.id
+        )
+      ) or 0
+      return self._to_topic_item(topic, version_count)
+
+  def set_best_version(self, topic_id: str, record_id: str, user_id: str) -> dict:
+    self._ensure_legacy_migrated()
+    with get_session() as session:
+      topic = session.get(TopicRecord, topic_id)
+      if not topic or topic.user_id != user_id:
+        raise ValueError("课题不存在")
+      record = session.get(WorkflowRecord, record_id)
+      if not record or record.topic_id != topic_id or record.user_id != user_id:
+        raise ValueError("版本不存在")
+      topic.best_record_id = record_id
+      topic.updated_at = datetime.now()
+      session.commit()
+      version_count = session.scalar(
+        select(func.count()).select_from(WorkflowRecord).where(
+          WorkflowRecord.topic_id == topic.id
+        )
+      ) or 0
+      return self._to_topic_item(topic, version_count)
 
   def list_records(
     self,
@@ -136,31 +404,144 @@ class ResultStore:
       return self._to_record(row)
 
   def compare(self, record_id_a: str, record_id_b: str, user_id: str) -> dict:
-    """对比两个方案"""
+    """对比两个方案版本，返回并排差异与优劣分析"""
     a = self.get(record_id_a, user_id)
     b = self.get(record_id_b, user_id)
     if not a or not b:
       raise ValueError("记录不存在")
 
-    comparison = {
-      "record_a": {"id": record_id_a, "created_at": a["created_at"], "scenario": a["scenario"]},
-      "record_b": {"id": record_id_b, "created_at": b["created_at"], "scenario": b["scenario"]},
-      "task_diffs": [],
-    }
+    _, task_names_a = self._resolve_scenario_meta(a["scenario"])
+    _, task_names_b = self._resolve_scenario_meta(b["scenario"])
+    task_names = {**task_names_a, **task_names_b}
+
+    insights_a = self._extract_review_insights(a.get("tasks", {}))
+    insights_b = self._extract_review_insights(b.get("tasks", {}))
+    advantages_a: list[str] = []
+    advantages_b: list[str] = []
+    task_diffs: list[dict] = []
 
     all_task_ids = set(a.get("tasks", {}).keys()) | set(b.get("tasks", {}).keys())
     for tid in sorted(all_task_ids):
       task_a = a.get("tasks", {}).get(tid, {})
       task_b = b.get("tasks", {}).get(tid, {})
-      comparison["task_diffs"].append({
+      output_a = task_a.get("output", "")
+      output_b = task_b.get("output", "")
+      len_a = len(output_a)
+      len_b = len(output_b)
+      task_name = task_names.get(tid, tid)
+
+      if len_a > len_b + 50:
+        advantages_a.append(f"「{task_name}」内容更详尽（多 {len_a - len_b} 字）")
+      elif len_b > len_a + 50:
+        advantages_b.append(f"「{task_name}」内容更详尽（多 {len_b - len_a} 字）")
+
+      if task_a.get("status") == "completed" and task_b.get("status") != "completed":
+        advantages_a.append(f"「{task_name}」已完成，另一版本未完成")
+      elif task_b.get("status") == "completed" and task_a.get("status") != "completed":
+        advantages_b.append(f"「{task_name}」已完成，另一版本未完成")
+
+      similarity = difflib.SequenceMatcher(None, output_a, output_b).ratio() if output_a or output_b else 1.0
+
+      task_diffs.append({
         "task_id": tid,
+        "task_name": task_name,
         "status_a": task_a.get("status", "missing"),
         "status_b": task_b.get("status", "missing"),
-        "output_length_a": len(task_a.get("output", "")),
-        "output_length_b": len(task_b.get("output", "")),
+        "output_a": output_a,
+        "output_b": output_b,
+        "output_length_a": len_a,
+        "output_length_b": len_b,
+        "similarity": round(similarity, 3),
+        "line_diff": self._line_diff(output_a, output_b),
       })
 
-    return comparison
+    if insights_a["score"] is not None and insights_b["score"] is not None:
+      if insights_a["score"] > insights_b["score"]:
+        advantages_a.append(f"终审评分更高（{insights_a['score']} vs {insights_b['score']} 分）")
+      elif insights_b["score"] > insights_a["score"]:
+        advantages_b.append(f"终审评分更高（{insights_b['score']} vs {insights_a['score']} 分）")
+
+    return {
+      "record_a": {
+        "id": record_id_a,
+        "title": a.get("title", ""),
+        "version_number": a.get("version_number", 1),
+        "created_at": a["created_at"],
+        "scenario": a["scenario"],
+        "pros": insights_a["pros"],
+        "cons": insights_a["cons"],
+      },
+      "record_b": {
+        "id": record_id_b,
+        "title": b.get("title", ""),
+        "version_number": b.get("version_number", 1),
+        "created_at": b["created_at"],
+        "scenario": b["scenario"],
+        "pros": insights_b["pros"],
+        "cons": insights_b["cons"],
+      },
+      "advantages_a": advantages_a,
+      "advantages_b": advantages_b,
+      "task_diffs": task_diffs,
+    }
+
+  @staticmethod
+  def _line_diff(text_a: str, text_b: str) -> list[dict]:
+    lines_a = text_a.splitlines()
+    lines_b = text_b.splitlines()
+    hunks: list[dict] = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, lines_a, lines_b).get_opcodes():
+      if tag == "equal":
+        hunks.append({"type": "equal", "lines_a": lines_a[i1:i2], "lines_b": lines_b[j1:j2]})
+      elif tag == "delete":
+        hunks.append({"type": "remove", "lines_a": lines_a[i1:i2], "lines_b": []})
+      elif tag == "insert":
+        hunks.append({"type": "add", "lines_a": [], "lines_b": lines_b[j1:j2]})
+      elif tag == "replace":
+        hunks.append({"type": "change", "lines_a": lines_a[i1:i2], "lines_b": lines_b[j1:j2]})
+    return hunks
+
+  @staticmethod
+  def _extract_review_insights(tasks: dict) -> dict:
+    review_output = ""
+    for tid, task in tasks.items():
+      if "review" in tid and task.get("output"):
+        review_output = task["output"]
+        break
+
+    pros: list[str] = []
+    cons: list[str] = []
+    score: int | None = None
+
+    if review_output:
+      score_match = re.search(r"质量评估[^0-9]*(\d+)", review_output)
+      if score_match:
+        score = int(score_match.group(1))
+
+      section_map = {
+        "pros": [r"主要优点", r"优点"],
+        "cons": [r"存在问题", r"问题与不足", r"不足之处"],
+      }
+      for section, patterns in section_map.items():
+        for pattern in patterns:
+          match = re.search(
+            rf"##?\s*\d*\.?\s*{pattern}\s*\n(.*?)(?=\n##|\Z)",
+            review_output,
+            re.DOTALL | re.IGNORECASE,
+          )
+          if match:
+            items = [
+              line.strip().lstrip("-•*0123456789. ").strip()
+              for line in match.group(1).splitlines()
+              if line.strip() and not line.strip().startswith("#")
+            ]
+            if section == "pros":
+              pros.extend(items[:5])
+            else:
+              cons.extend(items[:5])
+            break
+
+    return {"pros": pros, "cons": cons, "score": score}
 
   def get_markdown(self, record_id: str, user_id: str) -> str | None:
     record = self.get(record_id, user_id)
@@ -231,6 +612,78 @@ class ResultStore:
       "tasks": results,
     }
     return self.build_markdown(record)
+
+  def build_latex(self, record: dict) -> str:
+    scenario = record.get("scenario", "")
+    scenario_label, task_names = self._resolve_scenario_meta(scenario)
+    created_at = record.get("created_at", datetime.now().isoformat())
+    try:
+      created_display = datetime.fromisoformat(created_at).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+      created_display = created_at
+
+    title = record.get("title", "工作方案")
+    user_input = record.get("user_input", "")
+
+    sections: list[str] = [
+      r"\documentclass[UTF8]{ctexart}",
+      r"\usepackage{hyperref}",
+      r"\usepackage{geometry}",
+      r"\geometry{a4paper, margin=2.5cm}",
+      r"\usepackage{verbatim}",
+      r"\usepackage{enumitem}",
+      "",
+      rf"\title{{{_escape_latex(title)}}}",
+      rf"\author{{场景：{_escape_latex(scenario_label)}}}",
+      rf"\date{{{_escape_latex(created_display)}}}",
+      "",
+      r"\begin{document}",
+      r"\maketitle",
+      "",
+      r"\section*{用户需求}",
+      _escape_latex(user_input),
+      "",
+    ]
+
+    for tid, task in record.get("tasks", {}).items():
+      task_title = task_names.get(tid, tid)
+      sections.extend([
+        r"\section{" + _escape_latex(task_title) + "}",
+        rf"\textbf{{状态：}}{_escape_latex(task.get('status', 'unknown'))}",
+        "",
+      ])
+      if task.get("human_feedback"):
+        sections.extend([
+          r"\subsection*{人工审核意见}",
+          _markdown_to_latex(task["human_feedback"]),
+          "",
+        ])
+      if task.get("output"):
+        sections.append(_markdown_to_latex(task["output"]))
+        sections.append("")
+      elif task.get("error"):
+        sections.extend([
+          rf"\textbf{{错误：}}{_escape_latex(task['error'])}",
+          "",
+        ])
+
+    sections.extend([r"\end{document}", ""])
+    return "\n".join(sections)
+
+  def build_latex_from_workflow(
+    self,
+    scenario: str,
+    user_input: str,
+    results: dict,
+    created_at: str | None = None,
+  ) -> str:
+    record = {
+      "scenario": scenario,
+      "user_input": user_input,
+      "created_at": created_at or datetime.now().isoformat(),
+      "tasks": results,
+    }
+    return self.build_latex(record)
 
   def build_docx(self, md_content: str) -> bytes:
     html = markdown.markdown(
@@ -311,6 +764,8 @@ class ResultStore:
     title = row.title or generate_base_title(row.user_input, row.scenario)
     return {
       "id": row.id,
+      "topic_id": row.topic_id,
+      "version_number": row.version_number or 1,
       "title": title,
       "scenario": row.scenario,
       "user_input": row.user_input[:100],
@@ -324,12 +779,41 @@ class ResultStore:
     return {
       "id": row.id,
       "crew_id": row.crew_id,
+      "topic_id": row.topic_id,
+      "version_number": row.version_number or 1,
       "title": title,
       "scenario": row.scenario,
       "user_input": row.user_input,
       "created_at": row.created_at.isoformat(),
       "metadata": json.loads(row.metadata_json or "{}"),
       "tasks": json.loads(row.tasks_json or "{}"),
+    }
+
+  @staticmethod
+  def _to_topic_item(topic: TopicRecord, version_count: int) -> dict:
+    return {
+      "id": topic.id,
+      "title": topic.title,
+      "scenario": topic.scenario,
+      "user_input": topic.user_input[:200],
+      "version_count": version_count,
+      "best_record_id": topic.best_record_id,
+      "created_at": topic.created_at.isoformat(),
+      "updated_at": topic.updated_at.isoformat(),
+    }
+
+  @staticmethod
+  def _to_version_item(row: WorkflowRecord, best_record_id: str | None) -> dict:
+    tasks = json.loads(row.tasks_json or "{}")
+    return {
+      "id": row.id,
+      "topic_id": row.topic_id,
+      "version_number": row.version_number or 1,
+      "title": row.title,
+      "scenario": row.scenario,
+      "created_at": row.created_at.isoformat(),
+      "task_count": len(tasks),
+      "is_best": row.id == best_record_id,
     }
 
   def _resolve_scenario_meta(self, scenario: str) -> tuple[str, dict[str, str]]:

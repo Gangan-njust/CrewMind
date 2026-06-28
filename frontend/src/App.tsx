@@ -2,21 +2,37 @@ import { useState, useEffect, useRef } from 'react'
 import {
   Play, Users, History, Bot, LayoutDashboard,
   CheckCircle, Clock, AlertTriangle, XCircle, Loader,
-  Sun, Moon, Pause, FileText, FileDown, Upload, X,
+  Sun, Moon, Pause, FileText, FileDown, FileCode, Upload, X,
   Plus, Pencil, Trash2, Settings, LogOut, User, Search,
+  GitCompare, Star, LayoutTemplate, Bookmark, CircleHelp,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import { WorkflowVisualization } from './components/WorkflowVisualization'
 import {
   fetchScenarios, fetchAgents, startWorkflow, getWorkflowStatus,
   submitFeedback, suspendWorkflow, resumeWorkflow,
-  fetchHistory, fetchResult, connectWebSocket, downloadExport,
+  fetchResult, connectWebSocket, downloadExport,
   uploadReferenceFile, createAgent, updateAgent, deleteAgent, fetchAvailableTools,
   login, register, logout, fetchMe, isAuthenticated,
-  type Scenario, type Agent, type WorkflowStatus, type HistoryRecord,
+  fetchTopics, fetchTopicVersions, setBestVersion, compareResults,
+  fetchTemplates, createTemplate, deleteTemplate, fetchCollaborationModes,
+  type Scenario, type Agent, type WorkflowStatus,
+  type TopicRecord, type VersionRecord, type CompareResult,
   type AgentFormData, type ToolOption, type UserInfo,
+  type WorkflowTemplate, type TemplateListResponse,
+  type CollaborationMode, type CollaborationModeOption,
 } from './api'
+import {
+  applyTemplateVariables,
+  areTemplateVariablesFilled,
+  buildEmptyVariableValues,
+  getTemplateVariables,
+  getVariablePlaceholder,
+} from './templateUtils'
+import { HELP_SECTIONS } from './helpContent'
 
-type Page = 'dashboard' | 'workflow' | 'agents' | 'history'
+type Page = 'dashboard' | 'workflow' | 'agents' | 'history' | 'help'
 type Theme = 'dark' | 'light'
 
 const THEME_KEY = 'agentcrew-theme'
@@ -36,10 +52,12 @@ export default function App() {
   const settingsRef = useRef<HTMLDivElement>(null)
   const [scenarios, setScenarios] = useState<Scenario[]>([])
   const [agents, setAgents] = useState<Agent[]>([])
-  const [history, setHistory] = useState<HistoryRecord[]>([])
   const [selectedScenario, setSelectedScenario] = useState('')
   const [selectedAgents, setSelectedAgents] = useState<string[]>([])
+  const [collaborationMode, setCollaborationMode] = useState<CollaborationMode>('sequential')
+  const [collaborationModes, setCollaborationModes] = useState<CollaborationModeOption[]>([])
   const [activeWorkflowScenario, setActiveWorkflowScenario] = useState<Scenario | null>(null)
+  const [activeCollaborationMode, setActiveCollaborationMode] = useState<CollaborationMode>('sequential')
   const [userInput, setUserInput] = useState('')
   const [referenceFiles, setReferenceFiles] = useState<{ id: string; filename: string }[]>([])
   const [uploadingFile, setUploadingFile] = useState(false)
@@ -49,13 +67,20 @@ export default function App() {
   const [isRunning, setIsRunning] = useState(false)
   const [reviewTaskId, setReviewTaskId] = useState('')
   const [reviewFeedback, setReviewFeedback] = useState('')
-  const [selectedRecord, setSelectedRecord] = useState<any>(null)
+  const [regenerateTopic, setRegenerateTopic] = useState<TopicRecord | null>(null)
+  const [templates, setTemplates] = useState<TemplateListResponse>({ recommended: [], mine: [] })
+  const [activeTemplate, setActiveTemplate] = useState<WorkflowTemplate | null>(null)
+  const [templateVariableValues, setTemplateVariableValues] = useState<Record<string, string>>({})
+  const [showSaveTemplate, setShowSaveTemplate] = useState(false)
 
   const loadAppData = () => {
     fetchScenarios().then(setScenarios).catch(() => {})
     fetchAgents().then(setAgents).catch(() => {})
-    fetchHistory().then(setHistory).catch(() => {})
+    fetchTemplates().then(setTemplates).catch(() => {})
+    fetchCollaborationModes().then(setCollaborationModes).catch(() => {})
   }
+
+  const reloadTemplates = () => fetchTemplates().then(setTemplates).catch(() => {})
 
   useEffect(() => {
     const initAuth = async () => {
@@ -79,7 +104,6 @@ export default function App() {
       setAuthUser(null)
       setScenarios([])
       setAgents([])
-      setHistory([])
     }
     window.addEventListener('auth:logout', onLogout)
     return () => window.removeEventListener('auth:logout', onLogout)
@@ -120,7 +144,6 @@ export default function App() {
     setPage('dashboard')
     setCrewId('')
     setWorkflowStatus(null)
-    setSelectedRecord(null)
   }
 
   if (authLoading) {
@@ -136,10 +159,89 @@ export default function App() {
   }
 
   const handleScenarioSelect = (scenarioId: string) => {
+    if (activeTemplate && activeTemplate.scenario !== scenarioId) {
+      setActiveTemplate(null)
+      setTemplateVariableValues({})
+    }
     setSelectedScenario(scenarioId)
     const scenario = scenarios.find(s => s.id === scenarioId)
     if (scenario) {
-      setSelectedAgents(scenario.agents.map(a => a.id))
+      setSelectedAgents(
+        scenario.agents.filter(a => a.category !== 'domain_review').map(a => a.id)
+      )
+    }
+  }
+
+  const activeTemplateVariables = activeTemplate ? getTemplateVariables(activeTemplate) : []
+  const composedUserInput = activeTemplate
+    ? applyTemplateVariables(activeTemplate.user_input, templateVariableValues)
+    : userInput
+  const templateVariablesFilled = !activeTemplate
+    || areTemplateVariablesFilled(activeTemplateVariables, templateVariableValues)
+  const canStartWorkflow = !!selectedScenario
+    && selectedAgents.length > 0
+    && composedUserInput.length >= 10
+    && templateVariablesFilled
+
+  const handleRegenerateVersion = (topic: TopicRecord) => {
+    setRegenerateTopic(topic)
+    setActiveTemplate(null)
+    setTemplateVariableValues({})
+    setSelectedScenario(topic.scenario)
+    const scenario = scenarios.find(s => s.id === topic.scenario)
+    if (scenario) {
+      setSelectedAgents(
+        scenario.agents.filter(a => a.category !== 'domain_review').map(a => a.id)
+      )
+    }
+    setUserInput(topic.user_input)
+    setReferenceFiles([])
+    setPage('dashboard')
+  }
+
+  const handleApplyTemplate = (template: WorkflowTemplate) => {
+    setRegenerateTopic(null)
+    setActiveTemplate(template)
+    setTemplateVariableValues(buildEmptyVariableValues(getTemplateVariables(template)))
+    setSelectedScenario(template.scenario)
+    setSelectedAgents(template.selected_agents)
+    setUserInput('')
+    setReferenceFiles([])
+  }
+
+  const handleClearTemplate = () => {
+    setActiveTemplate(null)
+    setTemplateVariableValues({})
+    setUserInput('')
+  }
+
+  const handleTemplateVariableChange = (name: string, value: string) => {
+    setTemplateVariableValues(prev => ({ ...prev, [name]: value }))
+  }
+
+  const handleSaveTemplate = async (name: string, description: string) => {
+    await createTemplate({
+      name,
+      description,
+      scenario: selectedScenario,
+      user_input: activeTemplate ? activeTemplate.user_input : userInput,
+      selected_agents: selectedAgents,
+    })
+    reloadTemplates()
+    setShowSaveTemplate(false)
+  }
+
+  const handleDeleteTemplate = async (templateId: string) => {
+    if (!confirm('确定删除该模板？')) return
+    try {
+      await deleteTemplate(templateId)
+      if (activeTemplate?.id === templateId) {
+        setActiveTemplate(null)
+        setTemplateVariableValues({})
+      }
+      reloadTemplates()
+    } catch (e: any) {
+      alert(e.message)
     }
   }
 
@@ -148,17 +250,21 @@ export default function App() {
   const toggleTheme = () => setTheme(t => t === 'dark' ? 'light' : 'dark')
 
   const handleStart = async () => {
-    if (!selectedScenario || userInput.length < 10) return
+    if (!canStartWorkflow) return
     setIsRunning(true)
     setToolEvents([])
     try {
       const data = await startWorkflow(
         selectedScenario,
-        userInput,
+        composedUserInput,
         referenceFiles.map(f => f.id),
         selectedAgents,
+        regenerateTopic?.id,
+        collaborationMode,
       )
+      setRegenerateTopic(null)
       setCrewId(data.crew_id)
+      setActiveCollaborationMode(data.collaboration_mode || collaborationMode)
       setActiveWorkflowScenario({
         id: data.scenario,
         label: scenarios.find(s => s.id === data.scenario)?.label || data.scenario,
@@ -168,8 +274,9 @@ export default function App() {
       setWorkflowStatus({
         crew_id: data.crew_id,
         scenario: data.scenario,
+        collaboration_mode: data.collaboration_mode || collaborationMode,
         status: 'running',
-        user_input: userInput,
+        user_input: composedUserInput,
         results: {},
       })
       setPage('workflow')
@@ -249,7 +356,6 @@ export default function App() {
         }
         if (msg.type === 'crew_completed' || msg.type === 'crew_failed') {
           setIsRunning(false)
-          fetchHistory().then(setHistory)
         }
         if (msg.type === 'crew_suspended') {
           setIsRunning(false)
@@ -351,8 +457,12 @@ export default function App() {
           <Users size={18} /> Agent 角色
         </button>
         <button className={`nav-item ${page === 'history' ? 'active' : ''}`}
-          onClick={() => { setPage('history'); fetchHistory().then(setHistory) }}>
+          onClick={() => setPage('history')}>
           <History size={18} /> 历史方案
+        </button>
+        <button className={`nav-item ${page === 'help' ? 'active' : ''}`}
+          onClick={() => setPage('help')}>
+          <CircleHelp size={18} /> 使用帮助
         </button>
 
         <div className="sidebar-spacer" />
@@ -389,6 +499,12 @@ export default function App() {
             onToggleAgent={toggleAgent}
             userInput={userInput}
             onInputChange={setUserInput}
+            composedUserInput={composedUserInput}
+            canStartWorkflow={canStartWorkflow}
+            templateVariableValues={templateVariableValues}
+            onTemplateVariableChange={handleTemplateVariableChange}
+            templateVariablesFilled={templateVariablesFilled}
+            activeTemplateVariables={activeTemplateVariables}
             referenceFiles={referenceFiles}
             onUploadFile={async (file: File) => {
               setUploadingFile(true)
@@ -405,6 +521,20 @@ export default function App() {
             uploadingFile={uploadingFile}
             onStart={handleStart}
             isRunning={isRunning}
+            regenerateTopic={regenerateTopic}
+            onClearRegenerate={() => setRegenerateTopic(null)}
+            templates={templates}
+            activeTemplate={activeTemplate}
+            onApplyTemplate={handleApplyTemplate}
+            onClearTemplate={handleClearTemplate}
+            onSaveTemplate={() => setShowSaveTemplate(true)}
+            onDeleteTemplate={handleDeleteTemplate}
+            showSaveTemplate={showSaveTemplate}
+            onCloseSaveTemplate={() => setShowSaveTemplate(false)}
+            onConfirmSaveTemplate={handleSaveTemplate}
+            collaborationMode={collaborationMode}
+            onCollaborationModeChange={setCollaborationMode}
+            collaborationModes={collaborationModes}
           />
         )}
 
@@ -421,6 +551,7 @@ export default function App() {
             onResume={handleResume}
             toolEvents={toolEvents}
             crewId={crewId}
+            collaborationMode={activeCollaborationMode}
           />
         )}
 
@@ -430,15 +561,29 @@ export default function App() {
 
         {page === 'history' && (
           <HistoryPage
-            history={history}
-            selectedRecord={selectedRecord}
-            onSelect={async (id: string) => {
-              const record = await fetchResult(id)
-              setSelectedRecord(record)
+            onRegenerateVersion={handleRegenerateVersion}
+            onSaveAsTemplate={async (topic: TopicRecord, agents: string[]) => {
+              const name = prompt('模板名称', topic.title || '我的方案模板')
+              if (!name?.trim()) return
+              try {
+                await createTemplate({
+                  name: name.trim(),
+                  description: `来自历史课题「${topic.title}」`,
+                  scenario: topic.scenario,
+                  user_input: topic.user_input,
+                  selected_agents: agents,
+                })
+                reloadTemplates()
+                alert('模板已保存，可在工作台「我的模板」中使用')
+              } catch (e: any) {
+                alert(e.message)
+              }
             }}
-            onClose={() => setSelectedRecord(null)}
+            scenarios={scenarios}
           />
         )}
+
+        {page === 'help' && <HelpPage />}
       </main>
     </div>
   )
@@ -616,11 +761,86 @@ function SettingsPopover({
 
 /* ── Dashboard Page ─────────────────────────────────────────── */
 
+function SaveTemplateModal({
+  onClose,
+  onSave,
+}: {
+  onClose: () => void
+  onSave: (name: string, description: string) => Promise<void>
+}) {
+  const [name, setName] = useState('')
+  const [description, setDescription] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!name.trim()) return
+    setSaving(true)
+    try {
+      await onSave(name.trim(), description.trim())
+    } catch (err: any) {
+      alert(err.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <h3>保存为模板</h3>
+          <button className="icon-btn" onClick={onClose} title="关闭"><X size={16} /></button>
+        </div>
+        <form onSubmit={handleSubmit}>
+          <div className="form-group">
+            <label className="form-label">模板名称</label>
+            <input
+              className="form-input"
+              value={name}
+              onChange={e => setName(e.target.value)}
+              placeholder="例如：课题组常用文献综述"
+              required
+              autoFocus
+            />
+          </div>
+          <div className="form-group">
+            <label className="form-label">说明（可选）</label>
+            <input
+              className="form-input"
+              value={description}
+              onChange={e => setDescription(e.target.value)}
+              placeholder="简要描述适用场景"
+            />
+          </div>
+          <p className="form-hint">
+            将保存当前场景、勾选的 Agent 与需求描述。使用模板时保存的是带占位符的模板结构，而非已填写的具体内容。
+          </p>
+          <div className="form-actions">
+            <button className="btn btn-primary" type="submit" disabled={saving || !name.trim()}>
+              {saving ? <Loader size={16} className="spinner" /> : <Bookmark size={16} />}
+              保存模板
+            </button>
+            <button className="btn btn-outline" type="button" onClick={onClose}>取消</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  )
+}
+
 function DashboardPage({
   scenarios, agents, selectedScenario, onSelectScenario,
   selectedAgents, onToggleAgent,
-  userInput, onInputChange,
+  userInput, onInputChange, composedUserInput, canStartWorkflow,
+  templateVariableValues, onTemplateVariableChange,
+  templateVariablesFilled, activeTemplateVariables,
   referenceFiles, onUploadFile, onRemoveFile, uploadingFile, onStart, isRunning,
+  regenerateTopic, onClearRegenerate,
+  templates, activeTemplate, onApplyTemplate, onClearTemplate,
+  onSaveTemplate, onDeleteTemplate,
+  showSaveTemplate, onCloseSaveTemplate, onConfirmSaveTemplate,
+  collaborationMode, onCollaborationModeChange, collaborationModes,
 }: any) {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -630,11 +850,125 @@ function DashboardPage({
 
   const scenario = scenarios.find((s: Scenario) => s.id === selectedScenario)
   const scenarioAgentIds = new Set(scenario?.agents.map((a: { id: string }) => a.id) || [])
+  const canSaveTemplate = selectedScenario && selectedAgents.length > 0
+    && (activeTemplate ? activeTemplate.user_input.length >= 10 : userInput.length >= 10)
+  const filledVariableCount = activeTemplateVariables.filter(
+    (v: string) => (templateVariableValues[v] || '').trim().length > 0
+  ).length
 
   return (
     <>
       <h2 className="page-title">创建工作方案</h2>
       <p className="page-desc">选择场景类型，挑选协作角色，描述您的研究需求，多智能体团队将协作为您制定方案。</p>
+
+      <div className="form-group">
+        <div className="template-section-header">
+          <label className="form-label" style={{ margin: 0 }}>
+            <LayoutTemplate size={16} style={{ verticalAlign: 'middle', marginRight: 6 }} />
+            从模板快速开始
+          </label>
+        </div>
+        <p className="form-hint">选用推荐或已保存的模板，预填场景与 Agent 配置，通过下方输入框填写关键参数即可。</p>
+
+        {templates.recommended?.length > 0 && (
+          <>
+            <div className="template-subtitle">常用推荐</div>
+            <div className="template-grid">
+              {templates.recommended.map((tpl: WorkflowTemplate) => (
+                <div
+                  key={tpl.id}
+                  className={`template-card recommended ${activeTemplate?.id === tpl.id ? 'active' : ''}`}
+                  onClick={() => onApplyTemplate(tpl)}
+                >
+                  <div className="template-card-name">{tpl.name}</div>
+                  <div className="template-card-desc">{tpl.description}</div>
+                  <div className="template-card-meta">
+                    {scenarios.find((s: Scenario) => s.id === tpl.scenario)?.label || tpl.scenario}
+                    · {tpl.selected_agents.length} 个 Agent
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        {templates.mine?.length > 0 && (
+          <>
+            <div className="template-subtitle">我的模板</div>
+            <div className="template-grid">
+              {templates.mine.map((tpl: WorkflowTemplate) => (
+                <div
+                  key={tpl.id}
+                  className={`template-card ${activeTemplate?.id === tpl.id ? 'active' : ''}`}
+                  onClick={() => onApplyTemplate(tpl)}
+                >
+                  <div className="template-card-header">
+                    <div className="template-card-name">{tpl.name}</div>
+                    <button
+                      className="icon-btn danger"
+                      title="删除模板"
+                      onClick={(e) => { e.stopPropagation(); onDeleteTemplate(tpl.id) }}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                  {tpl.description && <div className="template-card-desc">{tpl.description}</div>}
+                  <div className="template-card-meta">
+                    {scenarios.find((s: Scenario) => s.id === tpl.scenario)?.label || tpl.scenario}
+                    · {tpl.selected_agents.length} 个 Agent
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+
+      {activeTemplate && (
+        <div className="template-active-banner">
+          <div>
+            <strong>已加载模板：{activeTemplate.name}</strong>
+            {activeTemplateVariables.length > 0 && (
+              <div className="template-variables">
+                填写进度：{filledVariableCount}/{activeTemplateVariables.length}
+                {!templateVariablesFilled && (
+                  <span className="template-progress-hint"> · 请完成下方所有参数后再启动</span>
+                )}
+              </div>
+            )}
+          </div>
+          <button className="btn btn-outline btn-sm" onClick={onClearTemplate}>清除模板</button>
+        </div>
+      )}
+
+      {regenerateTopic && (
+        <div className="regenerate-banner">
+          <span>正在为课题「{regenerateTopic.title}」生成新版本（将自动归入同一课题）</span>
+          <button className="btn btn-outline btn-sm" onClick={onClearRegenerate}>取消</button>
+        </div>
+      )}
+
+      <div className="form-group">
+        <label className="form-label">协作模式</label>
+        <p className="form-hint">
+          串行模式按固定流程依次执行；辩论模式通过正反方多轮答辩完善方案；投票模式由多个求解者并行生成方案后聚合选出最优。
+        </p>
+        <select
+          className="form-input"
+          value={collaborationMode}
+          onChange={e => onCollaborationModeChange(e.target.value)}
+          disabled={isRunning}
+          aria-label="协作模式"
+        >
+          {(collaborationModes.length > 0 ? collaborationModes : [
+            { id: 'sequential', label: '串行模式' },
+            { id: 'debate', label: '辩论模式' },
+            { id: 'voting', label: '投票模式' },
+          ]).map((mode: CollaborationModeOption) => (
+            <option key={mode.id} value={mode.id}>{mode.label}</option>
+          ))}
+        </select>
+      </div>
 
       <div className="form-group">
         <label className="form-label">选择场景</label>
@@ -655,7 +989,7 @@ function DashboardPage({
         </div>
       </div>
 
-      {selectedScenario && (
+      {selectedScenario && collaborationMode === 'sequential' && (
         <div className="form-group">
           <label className="form-label">选择协作角色</label>
           <p className="form-hint">
@@ -679,7 +1013,12 @@ function DashboardPage({
                   <div className="agent-select-info">
                     <div className="agent-select-name">
                       {agent.name}
-                      {agent.is_builtin && <span className="builtin-badge">内置</span>}
+                      {agent.is_builtin && agent.category === 'domain_review' && (
+                        <span className="domain-badge">领域审稿</span>
+                      )}
+                      {agent.is_builtin && agent.category !== 'domain_review' && (
+                        <span className="builtin-badge">内置</span>
+                      )}
                       {!agent.is_builtin && <span className="custom-badge">自定义</span>}
                       {!inScenario && checked && <span className="extra-badge">额外加入</span>}
                     </div>
@@ -692,15 +1031,51 @@ function DashboardPage({
         </div>
       )}
 
+      {activeTemplate && activeTemplateVariables.length > 0 && (
+        <div className="form-group">
+          <label className="form-label">填写模板参数</label>
+          <p className="form-hint">在输入框中填写各项关键信息，系统将自动生成完整需求描述。</p>
+          <div className="template-variable-grid">
+            {activeTemplateVariables.map((variable: string) => (
+              <div key={variable} className="form-group template-variable-field">
+                <label className="form-label">{variable}</label>
+                <input
+                  className="form-input"
+                  value={templateVariableValues[variable] || ''}
+                  onChange={e => onTemplateVariableChange(variable, e.target.value)}
+                  placeholder={getVariablePlaceholder(variable)}
+                  disabled={isRunning}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="form-group">
-        <label className="form-label">研究需求描述</label>
-        <textarea
-          className="form-textarea"
-          placeholder="请详细描述您的研究课题，包括研究背景、目标、约束条件等。例如：我们课题组计划研究深度学习在医学影像诊断中的应用，需要设计一套完整的实验方案..."
-          value={userInput}
-          onChange={e => onInputChange(e.target.value)}
-          rows={6}
-        />
+        <label className="form-label">
+          {activeTemplate ? '需求描述预览' : '研究需求描述'}
+        </label>
+        {activeTemplate ? (
+          <>
+            <p className="form-hint">根据上方参数自动生成的完整描述，启动时将使用此内容。</p>
+            <textarea
+              className="form-textarea template-preview"
+              value={composedUserInput}
+              readOnly
+              rows={8}
+              aria-label="根据模板参数生成的需求描述预览"
+            />
+          </>
+        ) : (
+          <textarea
+            className="form-textarea"
+            placeholder="请详细描述您的研究课题，包括研究背景、目标、约束条件等。例如：我们课题组计划研究深度学习在医学影像诊断中的应用，需要设计一套完整的实验方案..."
+            value={userInput}
+            onChange={e => onInputChange(e.target.value)}
+            rows={6}
+          />
+        )}
       </div>
 
       <div className="form-group">
@@ -740,11 +1115,28 @@ function DashboardPage({
         )}
       </div>
 
-      <button className="btn btn-primary" onClick={onStart}
-        disabled={!selectedScenario || selectedAgents.length === 0 || userInput.length < 10 || isRunning}>
-        {isRunning ? <><Loader size={16} className="spinner" /> 启动中...</> :
-          <><Play size={16} /> 启动多智能体工作流</>}
-      </button>
+      <div className="dashboard-actions">
+        <button className="btn btn-primary" onClick={onStart}
+          disabled={!canStartWorkflow || isRunning}>
+          {isRunning ? <><Loader size={16} className="spinner" /> 启动中...</> :
+            <><Play size={16} /> 启动多智能体工作流</>}
+        </button>
+        <button
+          className="btn btn-outline"
+          onClick={onSaveTemplate}
+          disabled={!canSaveTemplate || isRunning}
+          title="将当前配置保存为可复用模板"
+        >
+          <Bookmark size={16} /> 保存为模板
+        </button>
+      </div>
+
+      {showSaveTemplate && (
+        <SaveTemplateModal
+          onClose={onCloseSaveTemplate}
+          onSave={onConfirmSaveTemplate}
+        />
+      )}
     </>
   )
 }
@@ -752,9 +1144,9 @@ function DashboardPage({
 /* ── Export Buttons ─────────────────────────────────────────── */
 
 function ExportButtons({ crewId, recordId }: { crewId?: string; recordId?: string }) {
-  const [exporting, setExporting] = useState<'md' | 'docx' | null>(null)
+  const [exporting, setExporting] = useState<'md' | 'docx' | 'tex' | null>(null)
 
-  const handleExport = async (format: 'md' | 'docx') => {
+  const handleExport = async (format: 'md' | 'docx' | 'tex') => {
     setExporting(format)
     try {
       await downloadExport({ format, crewId, recordId })
@@ -784,6 +1176,14 @@ function ExportButtons({ crewId, recordId }: { crewId?: string; recordId?: strin
         {exporting === 'docx' ? <Loader size={16} className="spinner" /> : <FileDown size={16} />}
         导出 Word
       </button>
+      <button
+        className="btn btn-outline"
+        onClick={() => handleExport('tex')}
+        disabled={!!exporting}
+      >
+        {exporting === 'tex' ? <Loader size={16} className="spinner" /> : <FileCode size={16} />}
+        导出 LaTeX
+      </button>
     </div>
   )
 }
@@ -793,6 +1193,7 @@ function ExportButtons({ crewId, recordId }: { crewId?: string; recordId?: strin
 function WorkflowPage({
   scenario, workflowStatus, isRunning, reviewTaskId, reviewFeedback,
   onReviewFeedbackChange, onReview, onSuspend, onResume, crewId, toolEvents,
+  collaborationMode,
 }: any) {
   if (!workflowStatus) {
     return (
@@ -801,22 +1202,6 @@ function WorkflowPage({
         <p>请先从工作台启动一个工作流</p>
       </div>
     )
-  }
-
-  const statusIcon = (status: string) => {
-    switch (status) {
-      case 'running': return <Loader size={16} className="spinner" />
-      case 'completed': return <CheckCircle size={16} color="#00b894" />
-      case 'waiting_human': return <AlertTriangle size={16} color="#fdcb6e" />
-      case 'suspended': return <Pause size={16} color="#e17055" />
-      case 'failed': return <XCircle size={16} color="#e17055" />
-      default: return <Clock size={16} color="#6b7194" />
-    }
-  }
-
-  const statusLabel: Record<string, string> = {
-    pending: '等待中', running: '执行中', completed: '已完成',
-    waiting_human: '待审核', suspended: '已中止', failed: '失败',
   }
 
   const crewStatusLabel: Record<string, string> = {
@@ -828,10 +1213,17 @@ function WorkflowPage({
   const canResume = workflowStatus.status === 'suspended'
   const canExport = workflowStatus.status === 'completed' || workflowStatus.status === 'failed'
 
+  const modeLabel: Record<string, string> = {
+    sequential: '串行模式',
+    debate: '辩论模式',
+    voting: '投票模式',
+  }
   return (
     <>
       <h2 className="page-title">工作流执行</h2>
       <p className="page-desc">
+        协作模式: <span className="collaboration-mode-badge">{modeLabel[collaborationMode] || collaborationMode}</span>
+        {' · '}
         状态: <span className={`status-badge ${workflowStatus.status}`}>
           {crewStatusLabel[workflowStatus.status] || workflowStatus.status}
         </span>
@@ -871,74 +1263,16 @@ function WorkflowPage({
         </div>
       )}
 
-      <div className="workflow-timeline">
-        {(scenario?.tasks || []).map((task: any) => {
-          const result = workflowStatus.results?.[task.id]
-          const status = result?.status || 'pending'
-
-          return (
-            <div key={task.id} className="timeline-item">
-              <div className={`timeline-dot ${status}`}>
-                {statusIcon(status)}
-              </div>
-              <div className="timeline-content">
-                <div className="timeline-header">
-                  <div>
-                    <div className="timeline-title">{task.name}</div>
-                    <div className="timeline-agent">
-                      负责: {scenario?.agents?.find((a: any) => a.id === task.agent_id)?.name || task.agent_id}
-                      {task.requires_human_review && ' · 需人工审核'}
-                    </div>
-                  </div>
-                  <span className={`status-badge ${status}`}>{statusLabel[status] || status}</span>
-                </div>
-
-                {(result?.output || status === 'running' || status === 'suspended') && (
-                  <div className="markdown-output">
-                    {result?.output ? (
-                      <ReactMarkdown>{result.output}</ReactMarkdown>
-                    ) : (
-                      <span style={{ color: 'var(--text-secondary)', fontSize: 13 }}>
-                        正在生成...
-                      </span>
-                    )}
-                  </div>
-                )}
-
-                {result?.error && (
-                  <div style={{ color: 'var(--danger)', fontSize: 13, marginTop: 8 }}>
-                    错误: {result.error}
-                  </div>
-                )}
-
-                {status === 'waiting_human' && task.id === reviewTaskId && (
-                  <div className="review-panel">
-                    <h4>人工审核</h4>
-                    <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 8 }}>
-                      请审核上述输出，可以输入修改意见后批准，或直接驳回。
-                    </p>
-                    <textarea
-                      className="form-textarea"
-                      placeholder="输入审核意见或修改建议（可选）..."
-                      value={reviewFeedback}
-                      onChange={e => onReviewFeedbackChange(e.target.value)}
-                      rows={3}
-                    />
-                    <div className="review-actions">
-                      <button className="btn btn-success" onClick={() => onReview(true)}>
-                        <CheckCircle size={16} /> 批准并继续
-                      </button>
-                      <button className="btn btn-danger" onClick={() => onReview(false)}>
-                        <XCircle size={16} /> 驳回
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          )
-        })}
-      </div>
+      <WorkflowVisualization
+        tasks={scenario?.tasks || []}
+        agents={scenario?.agents || []}
+        results={workflowStatus.results || {}}
+        collaborationMode={collaborationMode}
+        reviewTaskId={reviewTaskId}
+        reviewFeedback={reviewFeedback}
+        onReviewFeedbackChange={onReviewFeedbackChange}
+        onReview={onReview}
+      />
     </>
   )
 }
@@ -952,6 +1286,53 @@ const EMPTY_AGENT_FORM: AgentFormData = {
   goal: '',
   tools: [],
   use_reasoning: false,
+}
+
+function AgentCard({
+  agent,
+  onEdit,
+  onDelete,
+}: {
+  agent: Agent
+  onEdit: (agent: Agent) => void
+  onDelete: (agent: Agent) => void
+}) {
+  return (
+    <div className={`agent-card ${agent.is_builtin ? '' : 'custom'}`}>
+      <div className="agent-card-header">
+        <h3>{agent.name}</h3>
+        {!agent.is_builtin && (
+          <div className="agent-card-actions">
+            <button className="icon-btn" onClick={() => onEdit(agent)} title="编辑">
+              <Pencil size={14} />
+            </button>
+            <button className="icon-btn danger" onClick={() => onDelete(agent)} title="删除">
+              <Trash2 size={14} />
+            </button>
+          </div>
+        )}
+      </div>
+      <div className="agent-title">
+        {agent.title}
+        {agent.is_builtin && agent.category === 'domain_review' && (
+          <span className="domain-badge">领域审稿</span>
+        )}
+        {agent.is_builtin && agent.category !== 'domain_review' && (
+          <span className="builtin-badge">内置</span>
+        )}
+        {!agent.is_builtin && <span className="custom-badge">自定义</span>}
+      </div>
+      <p><strong>背景：</strong>{agent.background}</p>
+      <p><strong>目标：</strong>{agent.goal}</p>
+      {agent.tools.length > 0 && (
+        <div className="scenario-agents">
+          {agent.tools.map(t => (
+            <span key={t} className="agent-tag">{t}</span>
+          ))}
+        </div>
+      )}
+    </div>
+  )
 }
 
 function AgentsPage({ agents, onAgentsChange }: { agents: Agent[]; onAgentsChange: () => void }) {
@@ -1037,7 +1418,7 @@ function AgentsPage({ agents, onAgentsChange }: { agents: Agent[]; onAgentsChang
         <div>
           <h2 className="page-title">Agent 角色</h2>
           <p className="page-desc">
-            系统内置 {agents.filter(a => a.is_builtin).length} 个核心角色，已自定义 {agents.filter(a => !a.is_builtin).length} 个。
+            系统内置 {agents.filter(a => a.is_builtin).length} 个角色（含 {agents.filter(a => a.is_builtin && a.category === 'domain_review').length} 个学科领域审稿专家），已自定义 {agents.filter(a => !a.is_builtin).length} 个。
           </p>
         </div>
         <button className="btn btn-primary" onClick={openCreate}>
@@ -1133,81 +1514,314 @@ function AgentsPage({ agents, onAgentsChange }: { agents: Agent[]; onAgentsChang
       )}
 
       <div className="agent-grid">
-        {agents.map(agent => (
-          <div key={agent.id} className={`agent-card ${agent.is_builtin ? '' : 'custom'}`}>
-            <div className="agent-card-header">
-              <h3>{agent.name}</h3>
-              {!agent.is_builtin && (
-                <div className="agent-card-actions">
-                  <button className="icon-btn" onClick={() => openEdit(agent)} title="编辑">
-                    <Pencil size={14} />
-                  </button>
-                  <button className="icon-btn danger" onClick={() => handleDelete(agent)} title="删除">
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-              )}
-            </div>
-            <div className="agent-title">
-              {agent.title}
-              {agent.is_builtin
-                ? <span className="builtin-badge">内置</span>
-                : <span className="custom-badge">自定义</span>}
-            </div>
-            <p><strong>背景：</strong>{agent.background}</p>
-            <p><strong>目标：</strong>{agent.goal}</p>
-            {agent.tools.length > 0 && (
-              <div className="scenario-agents">
-                {agent.tools.map(t => (
-                  <span key={t} className="agent-tag">{t}</span>
-                ))}
-              </div>
-            )}
-          </div>
-        ))}
+        {agents.filter(a => a.is_builtin && a.category !== 'domain_review').length > 0 && (
+          <>
+            <h3 className="agent-section-title">核心协作角色</h3>
+            {agents.filter(a => a.is_builtin && a.category !== 'domain_review').map(agent => (
+              <AgentCard key={agent.id} agent={agent} onEdit={openEdit} onDelete={handleDelete} />
+            ))}
+          </>
+        )}
+        {agents.filter(a => a.is_builtin && a.category === 'domain_review').length > 0 && (
+          <>
+            <h3 className="agent-section-title">学科领域审稿专家</h3>
+            {agents.filter(a => a.is_builtin && a.category === 'domain_review').map(agent => (
+              <AgentCard key={agent.id} agent={agent} onEdit={openEdit} onDelete={handleDelete} />
+            ))}
+          </>
+        )}
+        {agents.filter(a => !a.is_builtin).length > 0 && (
+          <>
+            <h3 className="agent-section-title">自定义角色</h3>
+            {agents.filter(a => !a.is_builtin).map(agent => (
+              <AgentCard key={agent.id} agent={agent} onEdit={openEdit} onDelete={handleDelete} />
+            ))}
+          </>
+        )}
       </div>
     </>
   )
 }
 
+/* ── Help Page ──────────────────────────────────────────────── */
+
+function HelpPage() {
+  const [activeSection, setActiveSection] = useState(HELP_SECTIONS[0].id)
+
+  const current = HELP_SECTIONS.find(s => s.id === activeSection) || HELP_SECTIONS[0]
+
+  return (
+    <div className="help-layout">
+      <nav className="help-nav">
+        <h2 className="help-nav-title">使用帮助</h2>
+        <p className="help-nav-desc">快速了解 AgentCrew 的使用方法</p>
+        <ul className="help-nav-list">
+          {HELP_SECTIONS.map(section => (
+            <li key={section.id}>
+              <button
+                className={`help-nav-item ${activeSection === section.id ? 'active' : ''}`}
+                onClick={() => setActiveSection(section.id)}
+              >
+                {section.title}
+              </button>
+            </li>
+          ))}
+        </ul>
+      </nav>
+      <div className="help-content">
+        <h2 className="page-title">{current.title}</h2>
+        <div className="help-markdown">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{current.content}</ReactMarkdown>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /* ── History Page ───────────────────────────────────────────── */
 
-function HistoryPage({ history, selectedRecord, onSelect, onClose }: any) {
+type HistoryView = 'topics' | 'versions' | 'detail' | 'compare'
+
+function DiffPanel({ diff, side }: { diff: CompareResult['task_diffs'][0]['line_diff']; side: 'a' | 'b' }) {
+  return (
+    <div className="diff-panel">
+      {diff.map((hunk, i) => {
+        const lines = side === 'a' ? hunk.lines_a : hunk.lines_b
+        if (hunk.type === 'equal') {
+          return lines.map((line, j) => (
+            <div key={`${i}-${j}`} className="diff-line equal">{line || ' '}</div>
+          ))
+        }
+        if (side === 'a' && hunk.type === 'add') return null
+        if (side === 'b' && hunk.type === 'remove') return null
+        const cls = hunk.type === 'remove' ? 'remove' : hunk.type === 'add' ? 'add' : 'change'
+        return lines.map((line, j) => (
+          <div key={`${i}-${j}`} className={`diff-line ${cls}`}>{line || ' '}</div>
+        ))
+      })}
+    </div>
+  )
+}
+
+function CompareView({
+  comparison,
+  onBack,
+}: {
+  comparison: CompareResult
+  onBack: () => void
+}) {
+  const [activeTask, setActiveTask] = useState(comparison.task_diffs[0]?.task_id || '')
+
+  return (
+    <>
+      <div className="page-header-row">
+        <button className="btn btn-outline" onClick={onBack}>← 返回版本列表</button>
+        <h2 className="page-title" style={{ margin: 0 }}>版本对比</h2>
+      </div>
+      <p className="page-desc">
+        v{comparison.record_a.version_number} vs v{comparison.record_b.version_number}
+        · 相似度参考各任务输出
+      </p>
+
+      <div className="compare-summary-grid">
+        <div className="compare-summary-card">
+          <div className="compare-summary-header">
+            <span className="version-label">版本 A · v{comparison.record_a.version_number}</span>
+            <span className="compare-date">{new Date(comparison.record_a.created_at).toLocaleString('zh-CN')}</span>
+          </div>
+          {comparison.advantages_a.length > 0 && (
+            <div className="compare-advantages">
+              <strong>相对优势</strong>
+              <ul>{comparison.advantages_a.map((a, i) => <li key={i}>{a}</li>)}</ul>
+            </div>
+          )}
+          {comparison.record_a.pros.length > 0 && (
+            <div className="compare-pros">
+              <strong>终审优点</strong>
+              <ul>{comparison.record_a.pros.map((p, i) => <li key={i}>{p}</li>)}</ul>
+            </div>
+          )}
+          {comparison.record_a.cons.length > 0 && (
+            <div className="compare-cons">
+              <strong>终审不足</strong>
+              <ul>{comparison.record_a.cons.map((c, i) => <li key={i}>{c}</li>)}</ul>
+            </div>
+          )}
+        </div>
+        <div className="compare-summary-card">
+          <div className="compare-summary-header">
+            <span className="version-label">版本 B · v{comparison.record_b.version_number}</span>
+            <span className="compare-date">{new Date(comparison.record_b.created_at).toLocaleString('zh-CN')}</span>
+          </div>
+          {comparison.advantages_b.length > 0 && (
+            <div className="compare-advantages">
+              <strong>相对优势</strong>
+              <ul>{comparison.advantages_b.map((a, i) => <li key={i}>{a}</li>)}</ul>
+            </div>
+          )}
+          {comparison.record_b.pros.length > 0 && (
+            <div className="compare-pros">
+              <strong>终审优点</strong>
+              <ul>{comparison.record_b.pros.map((p, i) => <li key={i}>{p}</li>)}</ul>
+            </div>
+          )}
+          {comparison.record_b.cons.length > 0 && (
+            <div className="compare-cons">
+              <strong>终审不足</strong>
+              <ul>{comparison.record_b.cons.map((c, i) => <li key={i}>{c}</li>)}</ul>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="compare-task-tabs">
+        {comparison.task_diffs.map(task => (
+          <button
+            key={task.task_id}
+            className={`compare-task-tab ${activeTask === task.task_id ? 'active' : ''}`}
+            onClick={() => setActiveTask(task.task_id)}
+          >
+            {task.task_name}
+            <span className="similarity-badge">{(task.similarity * 100).toFixed(0)}%</span>
+          </button>
+        ))}
+      </div>
+
+      {comparison.task_diffs.filter(t => t.task_id === activeTask).map(task => (
+        <div key={task.task_id} className="compare-diff-container">
+          <div className="compare-diff-header">
+            <span>版本 A · v{comparison.record_a.version_number}（{task.output_length_a} 字）</span>
+            <span>版本 B · v{comparison.record_b.version_number}（{task.output_length_b} 字）</span>
+          </div>
+          <div className="compare-diff-columns">
+            <DiffPanel diff={task.line_diff} side="a" />
+            <DiffPanel diff={task.line_diff} side="b" />
+          </div>
+        </div>
+      ))}
+    </>
+  )
+}
+
+function HistoryPage({
+  onRegenerateVersion,
+  onSaveAsTemplate,
+  scenarios,
+}: {
+  onRegenerateVersion: (topic: TopicRecord) => void
+  onSaveAsTemplate: (topic: TopicRecord, agents: string[]) => void
+  scenarios: Scenario[]
+}) {
+  const [view, setView] = useState<HistoryView>('topics')
   const [searchQuery, setSearchQuery] = useState('')
-  const [displayHistory, setDisplayHistory] = useState<HistoryRecord[]>(history)
+  const [topics, setTopics] = useState<TopicRecord[]>([])
+  const [versions, setVersions] = useState<VersionRecord[]>([])
+  const [selectedTopic, setSelectedTopic] = useState<TopicRecord | null>(null)
+  const [selectedRecord, setSelectedRecord] = useState<any>(null)
+  const [compareSelection, setCompareSelection] = useState<string[]>([])
+  const [comparison, setComparison] = useState<CompareResult | null>(null)
   const [searching, setSearching] = useState(false)
+  const [loading, setLoading] = useState(false)
+
+  const loadTopics = async (search?: string) => {
+    setSearching(true)
+    try {
+      const data = await fetchTopics(undefined, search)
+      setTopics(data)
+    } catch {
+      setTopics([])
+    } finally {
+      setSearching(false)
+    }
+  }
 
   useEffect(() => {
-    if (!searchQuery.trim()) {
-      setDisplayHistory(history)
-    }
-  }, [history, searchQuery])
+    loadTopics()
+  }, [])
 
   useEffect(() => {
     const keyword = searchQuery.trim()
-    if (!keyword) return
-
-    const timer = setTimeout(async () => {
-      setSearching(true)
-      try {
-        const records = await fetchHistory(undefined, keyword)
-        setDisplayHistory(records)
-      } catch {
-        setDisplayHistory([])
-      } finally {
-        setSearching(false)
-      }
+    const timer = setTimeout(() => {
+      loadTopics(keyword || undefined)
     }, 300)
-
     return () => clearTimeout(timer)
   }, [searchQuery])
 
-  if (selectedRecord) {
+  const openTopic = async (topic: TopicRecord) => {
+    setLoading(true)
+    try {
+      const vers = await fetchTopicVersions(topic.id)
+      setSelectedTopic(topic)
+      setVersions(vers)
+      setCompareSelection([])
+      setView('versions')
+    } catch (e: any) {
+      alert(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const openRecord = async (recordId: string) => {
+    setLoading(true)
+    try {
+      const record = await fetchResult(recordId)
+      setSelectedRecord(record)
+      setView('detail')
+    } catch (e: any) {
+      alert(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleMarkBest = async (recordId: string) => {
+    if (!selectedTopic) return
+    try {
+      const updated = await setBestVersion(selectedTopic.id, recordId)
+      setSelectedTopic(updated)
+      const vers = await fetchTopicVersions(selectedTopic.id)
+      setVersions(vers)
+    } catch (e: any) {
+      alert(e.message)
+    }
+  }
+
+  const toggleCompareSelect = (recordId: string) => {
+    setCompareSelection(prev => {
+      if (prev.includes(recordId)) return prev.filter(id => id !== recordId)
+      if (prev.length >= 2) return [prev[1], recordId]
+      return [...prev, recordId]
+    })
+  }
+
+  const handleCompare = async () => {
+    if (compareSelection.length !== 2) return
+    setLoading(true)
+    try {
+      const result = await compareResults(compareSelection[0], compareSelection[1])
+      setComparison(result)
+      setView('compare')
+    } catch (e: any) {
+      alert(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  if (view === 'compare' && comparison) {
+    return <CompareView comparison={comparison} onBack={() => setView('versions')} />
+  }
+
+  if (view === 'detail' && selectedRecord) {
     return (
       <>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 24 }}>
-          <button className="btn btn-outline" onClick={onClose}>← 返回</button>
+          <button className="btn btn-outline" onClick={() => setView('versions')}>← 返回</button>
           <h2 className="page-title" style={{ margin: 0 }}>方案详情</h2>
+          {selectedRecord.version_number && (
+            <span className="version-badge">v{selectedRecord.version_number}</span>
+          )}
           <div style={{ marginLeft: 'auto' }}>
             <ExportButtons recordId={selectedRecord.id} />
           </div>
@@ -1236,10 +1850,101 @@ function HistoryPage({ history, selectedRecord, onSelect, onClose }: any) {
     )
   }
 
+  if (view === 'versions' && selectedTopic) {
+    return (
+      <>
+        <div className="page-header-row">
+          <button className="btn btn-outline" onClick={() => { setView('topics'); setSelectedTopic(null) }}>
+            ← 返回课题列表
+          </button>
+          <h2 className="page-title" style={{ margin: 0 }}>{selectedTopic.title}</h2>
+        </div>
+        <p className="page-desc">
+          {selectedTopic.scenario} · {selectedTopic.version_count} 个版本
+          · 更新于 {new Date(selectedTopic.updated_at).toLocaleString('zh-CN')}
+        </p>
+
+        <div className="version-toolbar">
+          <button className="btn btn-primary" onClick={() => onRegenerateVersion(selectedTopic)}>
+            <Plus size={16} /> 再生成一版
+          </button>
+          <button
+            className="btn btn-outline"
+            onClick={() => {
+              const scenario = scenarios.find(s => s.id === selectedTopic.scenario)
+              onSaveAsTemplate(selectedTopic, scenario?.agents.map(a => a.id) || [])
+            }}
+          >
+            <Bookmark size={16} /> 保存为模板
+          </button>
+          <button
+            className="btn btn-outline"
+            onClick={handleCompare}
+            disabled={compareSelection.length !== 2 || loading}
+          >
+            <GitCompare size={16} /> 对比所选版本
+            {compareSelection.length > 0 && ` (${compareSelection.length}/2)`}
+          </button>
+        </div>
+
+        <div className="card" style={{ marginBottom: 16 }}>
+          <div className="card-title">课题需求</div>
+          <p style={{ fontSize: 14, color: 'var(--text-secondary)' }}>{selectedTopic.user_input}</p>
+        </div>
+
+        {loading ? (
+          <div className="empty-state"><Loader size={32} className="spinner" /></div>
+        ) : versions.length === 0 ? (
+          <div className="empty-state"><History size={48} /><p>暂无版本</p></div>
+        ) : (
+          <div className="version-list">
+            {versions.map((ver: VersionRecord) => (
+              <div key={ver.id} className={`version-item ${ver.is_best ? 'is-best' : ''}`}>
+                <label className="version-checkbox" onClick={e => e.stopPropagation()}>
+                  <input
+                    type="checkbox"
+                    checked={compareSelection.includes(ver.id)}
+                    onChange={() => toggleCompareSelect(ver.id)}
+                  />
+                </label>
+                <div className="version-info" onClick={() => openRecord(ver.id)}>
+                  <div className="version-title-row">
+                    <span className="version-number">v{ver.version_number}</span>
+                    <span>{ver.title}</span>
+                    {ver.is_best && (
+                      <span className="best-badge"><Star size={12} /> 当前最佳</span>
+                    )}
+                  </div>
+                  <div className="history-meta">
+                    {ver.task_count} 个任务 · {new Date(ver.created_at).toLocaleString('zh-CN')}
+                  </div>
+                </div>
+                <div className="version-actions">
+                  {!ver.is_best && (
+                    <button
+                      className="btn btn-outline btn-sm"
+                      onClick={() => handleMarkBest(ver.id)}
+                      title="标记为当前最佳版本"
+                    >
+                      <Star size={14} /> 设为最佳
+                    </button>
+                  )}
+                  <button className="btn btn-outline btn-sm" onClick={() => openRecord(ver.id)}>
+                    查看
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </>
+    )
+  }
+
   return (
     <>
       <h2 className="page-title">历史方案</h2>
-      <p className="page-desc">查看和管理过往的工作方案记录。</p>
+      <p className="page-desc">按课题管理多个方案版本，支持对比差异与标记最佳版本。</p>
 
       <div className="history-search">
         <Search size={18} className="history-search-icon" />
@@ -1248,30 +1953,36 @@ function HistoryPage({ history, selectedRecord, onSelect, onClose }: any) {
           type="search"
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
-          placeholder="搜索方案标题或需求描述..."
+          placeholder="搜索课题标题或需求描述..."
         />
         {searching && <Loader size={16} className="history-search-loading" />}
       </div>
 
-      {displayHistory.length === 0 ? (
+      {topics.length === 0 ? (
         <div className="empty-state">
           <History size={48} />
-          <p>{searchQuery.trim() ? '未找到匹配的方案' : '暂无历史记录'}</p>
+          <p>{searchQuery.trim() ? '未找到匹配的课题' : '暂无历史记录'}</p>
         </div>
       ) : (
         <div className="history-list">
-          {displayHistory.map((record: HistoryRecord) => (
-            <div key={record.id} className="history-item" onClick={() => onSelect(record.id)}>
+          {topics.map((topic: TopicRecord) => (
+            <div key={topic.id} className="history-item topic-item" onClick={() => openTopic(topic)}>
               <div>
-                <div style={{ fontWeight: 500, fontSize: 14 }}>{record.title}</div>
-                <div className="history-meta">
-                  {record.scenario} · {record.task_count} 个任务 · {new Date(record.created_at).toLocaleString('zh-CN')}
+                <div style={{ fontWeight: 500, fontSize: 14, display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {topic.title}
+                  <span className="version-count-badge">{topic.version_count} 版</span>
+                  {topic.best_record_id && (
+                    <span className="best-badge small"><Star size={10} /> 已标记最佳</span>
+                  )}
                 </div>
-                {record.user_input && (
-                  <div className="history-preview">{record.user_input}</div>
+                <div className="history-meta">
+                  {topic.scenario} · 更新于 {new Date(topic.updated_at).toLocaleString('zh-CN')}
+                </div>
+                {topic.user_input && (
+                  <div className="history-preview">{topic.user_input}</div>
                 )}
               </div>
-              <span className="status-badge completed">查看</span>
+              <span className="status-badge completed">查看版本</span>
             </div>
           ))}
         </div>

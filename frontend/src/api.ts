@@ -15,7 +15,7 @@ export interface AuthResponse {
 export interface Scenario {
   id: string
   label: string
-  agents: { id: string; name: string; title: string }[]
+  agents: { id: string; name: string; title: string; category?: string }[]
   tasks: {
     id: string
     name: string
@@ -33,6 +33,7 @@ export interface Agent {
   goal: string
   tools: string[]
   use_reasoning?: boolean
+  category?: string
   is_builtin?: boolean
 }
 
@@ -56,11 +57,20 @@ export interface TaskResult {
   output: string
   error: string
   human_feedback: string
+  metadata?: Record<string, unknown>
+}
+
+export type CollaborationMode = 'sequential' | 'debate' | 'voting'
+
+export interface CollaborationModeOption {
+  id: CollaborationMode
+  label: string
 }
 
 export interface WorkflowStatus {
   crew_id: string
   scenario: string
+  collaboration_mode?: CollaborationMode
   status: string
   user_input: string
   results: Record<string, TaskResult>
@@ -68,11 +78,95 @@ export interface WorkflowStatus {
 
 export interface HistoryRecord {
   id: string
+  topic_id?: string
+  version_number?: number
   title: string
   scenario: string
   user_input: string
   created_at: string
   task_count: number
+}
+
+export interface TopicRecord {
+  id: string
+  title: string
+  scenario: string
+  user_input: string
+  version_count: number
+  best_record_id: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface VersionRecord {
+  id: string
+  topic_id: string
+  version_number: number
+  title: string
+  scenario: string
+  created_at: string
+  task_count: number
+  is_best: boolean
+}
+
+export interface CompareLineDiff {
+  type: 'equal' | 'remove' | 'add' | 'change'
+  lines_a: string[]
+  lines_b: string[]
+}
+
+export interface CompareTaskDiff {
+  task_id: string
+  task_name: string
+  status_a: string
+  status_b: string
+  output_a: string
+  output_b: string
+  output_length_a: number
+  output_length_b: number
+  similarity: number
+  line_diff: CompareLineDiff[]
+}
+
+export interface CompareResult {
+  record_a: {
+    id: string
+    title: string
+    version_number: number
+    created_at: string
+    scenario: string
+    pros: string[]
+    cons: string[]
+  }
+  record_b: {
+    id: string
+    title: string
+    version_number: number
+    created_at: string
+    scenario: string
+    pros: string[]
+    cons: string[]
+  }
+  advantages_a: string[]
+  advantages_b: string[]
+  task_diffs: CompareTaskDiff[]
+}
+
+export interface WorkflowTemplate {
+  id: string
+  name: string
+  description: string
+  scenario: string
+  user_input: string
+  selected_agents: string[]
+  is_builtin: boolean
+  variables: string[]
+  created_at?: string
+}
+
+export interface TemplateListResponse {
+  recommended: WorkflowTemplate[]
+  mine: WorkflowTemplate[]
 }
 
 export function getToken(): string | null {
@@ -202,11 +296,19 @@ export async function uploadReferenceFile(file: File) {
   return res.json() as Promise<{ id: string; filename: string; size: number }>
 }
 
+export async function fetchCollaborationModes(): Promise<CollaborationModeOption[]> {
+  const res = await authFetch(`${API_BASE}/collaboration-modes`)
+  if (!res.ok) throw new Error(await parseError(res, '加载协作模式失败'))
+  return res.json()
+}
+
 export async function startWorkflow(
   scenario: string,
   userInput: string,
   referenceFileIds?: string[],
   selectedAgents?: string[],
+  topicId?: string,
+  collaborationMode: CollaborationMode = 'sequential',
 ) {
   const res = await authFetch(`${API_BASE}/workflow/start`, {
     method: 'POST',
@@ -216,6 +318,8 @@ export async function startWorkflow(
       user_input: userInput,
       reference_file_ids: referenceFileIds ?? [],
       selected_agents: selectedAgents ?? [],
+      topic_id: topicId ?? null,
+      collaboration_mode: collaborationMode,
     }),
   })
   if (!res.ok) throw new Error(await parseError(res, '启动失败'))
@@ -253,6 +357,42 @@ export async function fetchHistory(scenario?: string, search?: string): Promise<
   return res.json()
 }
 
+export async function fetchTopics(scenario?: string, search?: string): Promise<TopicRecord[]> {
+  const params = new URLSearchParams()
+  if (scenario) params.set('scenario', scenario)
+  if (search) params.set('search', search)
+  const query = params.toString()
+  const res = await authFetch(`${API_BASE}/topics${query ? `?${query}` : ''}`)
+  if (!res.ok) throw new Error(await parseError(res, '加载课题失败'))
+  return res.json()
+}
+
+export async function fetchTopicVersions(topicId: string): Promise<VersionRecord[]> {
+  const res = await authFetch(`${API_BASE}/topics/${topicId}/versions`)
+  if (!res.ok) throw new Error(await parseError(res, '加载版本失败'))
+  return res.json()
+}
+
+export async function setBestVersion(topicId: string, recordId: string): Promise<TopicRecord> {
+  const res = await authFetch(`${API_BASE}/topics/${topicId}/best`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ record_id: recordId }),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '设置失败'))
+  return res.json()
+}
+
+export async function compareResults(recordIdA: string, recordIdB: string): Promise<CompareResult> {
+  const res = await authFetch(`${API_BASE}/results/compare`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ record_id_a: recordIdA, record_id_b: recordIdB }),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '对比失败'))
+  return res.json()
+}
+
 export async function fetchResult(recordId: string) {
   const res = await authFetch(`${API_BASE}/results/${recordId}`)
   if (!res.ok) throw new Error(await parseError(res, '加载记录失败'))
@@ -260,7 +400,7 @@ export async function fetchResult(recordId: string) {
 }
 
 export async function downloadExport(options: {
-  format: 'md' | 'docx'
+  format: 'md' | 'docx' | 'tex'
   recordId?: string
   crewId?: string
 }) {
@@ -304,6 +444,33 @@ export async function resumeWorkflow(crewId: string) {
   const res = await authFetch(`${API_BASE}/workflow/${crewId}/resume`, { method: 'POST' })
   if (!res.ok) throw new Error(await parseError(res, '继续失败'))
   return res.json()
+}
+
+export async function fetchTemplates(): Promise<TemplateListResponse> {
+  const res = await authFetch(`${API_BASE}/templates`)
+  if (!res.ok) throw new Error(await parseError(res, '加载模板失败'))
+  return res.json()
+}
+
+export async function createTemplate(data: {
+  name: string
+  description?: string
+  scenario: string
+  user_input: string
+  selected_agents: string[]
+}): Promise<WorkflowTemplate> {
+  const res = await authFetch(`${API_BASE}/templates`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '保存模板失败'))
+  return res.json()
+}
+
+export async function deleteTemplate(templateId: string): Promise<void> {
+  const res = await authFetch(`${API_BASE}/templates/${templateId}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(await parseError(res, '删除模板失败'))
 }
 
 export function connectWebSocket(crewId: string, onMessage: (data: any) => void) {

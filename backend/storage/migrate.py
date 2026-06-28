@@ -6,7 +6,7 @@ from sqlalchemy import inspect, select, text
 from backend.auth import get_user_by_username, hash_password
 from backend.config import settings
 from backend.storage.database import Base, get_session
-from backend.storage.models import CustomAgentRecord, User, WorkflowRecord
+from backend.storage.models import CustomAgentRecord, TopicRecord, User, WorkflowRecord, WorkflowTemplateRecord
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +47,32 @@ def run_migrations(engine) -> None:
       conn.execute(text("ALTER TABLE custom_agents ADD COLUMN user_id VARCHAR(36)"))
       logger.info("已为 custom_agents 添加 user_id 列")
 
+    if not _table_exists(inspector, "topics"):
+      TopicRecord.__table__.create(bind=conn)
+      logger.info("已创建 topics 表")
+
+    if _table_exists(inspector, "workflow_records") and not _column_exists(
+      inspector, "workflow_records", "topic_id"
+    ):
+      conn.execute(text("ALTER TABLE workflow_records ADD COLUMN topic_id VARCHAR(36)"))
+      logger.info("已为 workflow_records 添加 topic_id 列")
+
+    if _table_exists(inspector, "workflow_records") and not _column_exists(
+      inspector, "workflow_records", "version_number"
+    ):
+      conn.execute(
+        text("ALTER TABLE workflow_records ADD COLUMN version_number INTEGER DEFAULT 1")
+      )
+      logger.info("已为 workflow_records 添加 version_number 列")
+
+    if not _table_exists(inspector, "workflow_templates"):
+      WorkflowTemplateRecord.__table__.create(bind=conn)
+      logger.info("已创建 workflow_templates 表")
+
   _ensure_admin_user()
   _migrate_existing_data_to_admin()
   _backfill_workflow_titles()
+  _backfill_topics()
 
 
 def _ensure_admin_user() -> User:
@@ -127,3 +150,53 @@ def _migrate_existing_data_to_admin() -> None:
         migrated_records,
         migrated_agents,
       )
+
+
+def _backfill_topics() -> None:
+  """将已有方案按课题归组并分配版本号"""
+  from backend.storage.results import compute_topic_key, generate_base_title
+
+  with get_session() as session:
+    rows = session.scalars(
+      select(WorkflowRecord)
+      .where(WorkflowRecord.topic_id.is_(None))
+      .order_by(WorkflowRecord.user_id, WorkflowRecord.scenario, WorkflowRecord.created_at)
+    ).all()
+    if not rows:
+      return
+
+    topic_cache: dict[tuple[str | None, str], TopicRecord] = {}
+    version_counters: dict[str, int] = {}
+    created = 0
+
+    for row in rows:
+      if not row.user_id:
+        continue
+      key = compute_topic_key(row.user_input, row.scenario)
+      cache_key = (row.user_id, key)
+      topic = topic_cache.get(cache_key)
+      if not topic:
+        topic = TopicRecord(
+          id=str(__import__("uuid").uuid4()),
+          user_id=row.user_id,
+          scenario=row.scenario,
+          title=row.title or generate_base_title(row.user_input, row.scenario),
+          topic_key=key,
+          user_input=row.user_input,
+          best_record_id=None,
+          created_at=row.created_at,
+          updated_at=row.created_at,
+        )
+        session.add(topic)
+        topic_cache[cache_key] = topic
+        version_counters[topic.id] = 0
+        created += 1
+
+      version_counters[topic.id] += 1
+      row.topic_id = topic.id
+      row.version_number = version_counters[topic.id]
+      topic.updated_at = row.created_at
+
+    if created:
+      session.commit()
+      logger.info("已为 %d 条历史方案创建 %d 个课题分组", len(rows), created)

@@ -25,7 +25,13 @@ def setup_database() -> None:
   )
   SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False)
 
-  from backend.storage.models import CustomAgentRecord, User, WorkflowRecord  # noqa: F401
+  from backend.storage.models import (  # noqa: F401
+    CustomAgentRecord,
+    TopicRecord,
+    User,
+    WorkflowRecord,
+    WorkflowTemplateRecord,
+  )
 
   Base.metadata.create_all(bind=_engine)
 

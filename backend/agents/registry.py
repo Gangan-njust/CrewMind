@@ -23,6 +23,7 @@ def _record_to_role(record: CustomAgentRecord) -> AgentRole:
     goal=record.goal,
     tools=tools,
     use_reasoning=record.use_reasoning,
+    category="custom",
   )
 
 
@@ -65,6 +66,7 @@ def serialize_agent(role: AgentRole, builtin: bool) -> dict:
     "goal": role.goal,
     "tools": role.tools,
     "use_reasoning": role.use_reasoning,
+    "category": role.category,
     "is_builtin": builtin,
   }
 

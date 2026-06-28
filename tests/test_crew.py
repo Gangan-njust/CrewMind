@@ -215,17 +215,17 @@ class TestHumanReview:
       output="original",
     )
 
-    regen_calls: list[str] = []
+    regen_calls: list[tuple[str, str]] = []
 
-    async def regen_execute(self, task_id, agent, prompt, task_context, feedback="", partial_output=""):
-      regen_calls.append(feedback)
+    async def regen_execute(self, task_id, agent, prompt, task_context, feedback="", partial_output="", revision_base=""):
+      regen_calls.append((feedback, revision_base))
       self.results[task_id].output = f"revised-{feedback}"
       return self.results[task_id].output
 
     monkeypatch.setattr(Crew, "_execute_agent", regen_execute)
     await c.resume_with_feedback("task_a", feedback="请补充方法细节", approved=True)
 
-    assert regen_calls == ["请补充方法细节"]
+    assert regen_calls == [("请补充方法细节", "original")]
     assert c.results["task_a"].output == "revised-请补充方法细节"
     assert c.status == "completed"
 

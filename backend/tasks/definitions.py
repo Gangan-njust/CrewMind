@@ -2,6 +2,7 @@
 from dataclasses import dataclass, field
 from enum import Enum
 
+from backend.agents.citations import REFERENCE_CITATION_RULES
 from backend.agents.roles import ScenarioType
 
 
@@ -54,8 +55,101 @@ class TaskDefinition:
       OutputFormat.TEMPLATE: "请严格按照指定模板格式输出。",
     }
     parts.append(f"## 输出要求\n\n{fmt_hint[self.output_format]}")
+    if self.output_format == OutputFormat.MARKDOWN:
+      parts.append(REFERENCE_CITATION_RULES.strip())
 
     return "\n\n".join(parts)
+
+
+# ── 学科领域审稿任务（可选，勾选对应 Agent 时启用） ─────────────
+
+_DOMAIN_REVIEW_DEPS = ["task_cs_review", "task_bio_review", "task_material_review"]
+
+
+def _domain_review_tasks(depends_on: list[str]) -> list[TaskDefinition]:
+  return [
+    TaskDefinition(
+      id="task_cs_review",
+      name="计算机学科评审",
+      description=(
+        "以《计算机学报》审稿人身份，审查方案中算法设计、系统架构、实验验证等计算机相关部分，"
+        "评估技术先进性、实验完备性与可复现性，判断是否达到顶级期刊录用标准。"
+      ),
+      agent_id="cs_journal_reviewer",
+      depends_on=depends_on,
+      output_format=OutputFormat.MARKDOWN,
+      output_template="""# 计算机学科评审意见
+
+## 1. 总体评价（录用建议：接受/小修/大修/拒稿）
+## 2. 创新性评估
+（是否提出新算法/新框架/新模型）
+## 3. 实验设计审查
+（对比实验、消融实验、基线公平性、数据集选择）
+## 4. 可复现性与开源要求
+（代码、数据、环境说明）
+## 5. 方法描述与理论依据
+## 6. 主要问题与修改建议
+## 7. 评分（1-10）
+- 创新性：
+- 实验完备性：
+- 可复现性：
+- 整体质量：""",
+    ),
+    TaskDefinition(
+      id="task_bio_review",
+      name="生物学/生命科学评审",
+      description=(
+        "以 Cell Press / JIPB 等生物学期刊审稿人身份，审查生物实验设计的科学性与规范性，"
+        "评估对照组、样本量、统计方法、伦理合规及生物学意义。"
+      ),
+      agent_id="bio_journal_reviewer",
+      depends_on=depends_on,
+      output_format=OutputFormat.MARKDOWN,
+      output_template="""# 生物学/生命科学评审意见
+
+## 1. 总体评价（录用建议：接受/小修/大修/拒稿）
+## 2. 实验设计科学性
+（对照组、重复实验、盲法设计、样本量计算）
+## 3. 统计方法审查
+## 4. 生物学意义与创新性
+## 5. 伦理合规
+（动物实验、人体实验、伦理审查）
+## 6. 可重复性与数据共享
+## 7. 主要问题与修改建议
+## 8. 评分（1-10）
+- 实验设计：
+- 统计严谨性：
+- 生物学意义：
+- 整体质量：""",
+    ),
+    TaskDefinition(
+      id="task_material_review",
+      name="材料/化学学科评审",
+      description=(
+        "以《镁合金学报》/化学类期刊审稿人身份，审查材料制备/化学合成路线、"
+        "表征方法完备性与性能测试标准，评估可重复性与工程应用价值。"
+      ),
+      agent_id="material_journal_reviewer",
+      depends_on=depends_on,
+      output_format=OutputFormat.MARKDOWN,
+      output_template="""# 材料/化学学科评审意见
+
+## 1. 总体评价（录用建议：接受/小修/大修/拒稿）
+## 2. 技术路线可行性
+（制备/合成工艺、参数优化）
+## 3. 表征方法完备性
+（XRD、SEM、TEM、XPS 等是否充分）
+## 4. 性能测试与数据呈现
+## 5. 可重复性与批次一致性
+## 6. 工程应用价值
+## 7. 主要问题与修改建议
+## 8. 评分（1-10）
+- 技术路线：
+- 表征完备性：
+- 数据可信度：
+- 整体质量：""",
+    ),
+  ]
 
 
 # ── 各场景任务流程 ──────────────────────────────────────────────
@@ -90,14 +184,18 @@ TASK_FLOWS: dict[ScenarioType, list[TaskDefinition]] = {
 ## 3. 研究现状总结
 ## 4. 研究空白识别
 ## 5. 创新方向建议
-## 6. 参考文献列表""",
+## 6. 参考文献
+（正文引用编号与文末列表对应；每条格式：[编号] 作者. 标题. 期刊, 年份. [链接](URL)）
+## 7. 文献数据库说明
+（说明本次使用的检索数据库，如 Semantic Scholar、PubMed，及检索词）""",
     ),
+    *_domain_review_tasks(["task_planning", "task_literature"]),
     TaskDefinition(
       id="task_review",
       name="方案终审",
-      description="审查文献综述的完整性、准确性和学术规范性，输出终审报告。",
+      description="审查文献综述的完整性、准确性和学术规范性，并综合各学科审稿意见，输出终审报告。",
       agent_id="review_specialist",
-      depends_on=["task_planning", "task_literature"],
+      depends_on=["task_planning", "task_literature", *_DOMAIN_REVIEW_DEPS],
       requires_human_review=True,
       output_format=OutputFormat.MARKDOWN,
       output_template="""# 终审报告
@@ -153,12 +251,13 @@ TASK_FLOWS: dict[ScenarioType, list[TaskDefinition]] = {
 ## 5. 预算汇总表
 ## 6. 资源优化建议""",
     ),
+    *_domain_review_tasks(["task_planning", "task_experiment", "task_budget"]),
     TaskDefinition(
       id="task_review",
       name="方案终审",
-      description="综合审查实验方案和预算，输出最终工作方案。",
+      description="综合审查实验方案和预算，并综合各学科审稿意见，输出最终工作方案。",
       agent_id="review_specialist",
-      depends_on=["task_planning", "task_experiment", "task_budget"],
+      depends_on=["task_planning", "task_experiment", "task_budget", *_DOMAIN_REVIEW_DEPS],
       requires_human_review=True,
       output_format=OutputFormat.MARKDOWN,
     ),
@@ -197,12 +296,13 @@ TASK_FLOWS: dict[ScenarioType, list[TaskDefinition]] = {
       requires_human_review=True,
       output_format=OutputFormat.MARKDOWN,
     ),
+    *_domain_review_tasks(["task_planning", "task_literature", "task_experiment", "task_budget"]),
     TaskDefinition(
       id="task_review",
       name="方案终审",
-      description="综合审查，输出完整工作方案。",
+      description="综合审查，并整合各学科审稿意见，输出完整工作方案。",
       agent_id="review_specialist",
-      depends_on=["task_planning", "task_literature", "task_experiment", "task_budget"],
+      depends_on=["task_planning", "task_literature", "task_experiment", "task_budget", *_DOMAIN_REVIEW_DEPS],
       requires_human_review=True,
       output_format=OutputFormat.MARKDOWN,
     ),
