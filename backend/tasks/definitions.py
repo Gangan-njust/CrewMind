@@ -307,4 +307,85 @@ TASK_FLOWS: dict[ScenarioType, list[TaskDefinition]] = {
       output_format=OutputFormat.MARKDOWN,
     ),
   ],
+
+  ScenarioType.LITERATURE_BASED_PROPOSAL: [
+    TaskDefinition(
+      id="task_planning",
+      name="课题规划",
+      description=(
+        "基于用户选定的文献库分析结果，明确研究背景、目标与范围。"
+        "须优先引用用户文献库内容，标注引用编号。"
+      ),
+      agent_id="planner",
+      output_format=OutputFormat.MARKDOWN,
+      output_template="""# 开题报告 · 课题规划
+
+## 1. 研究背景
+（优先引用用户文献库 [编号]）
+## 2. 国内外研究现状
+## 3. 研究意义
+## 4. 研究目标
+## 5. 研究内容与技术路线
+## 6. 预期成果""",
+    ),
+    TaskDefinition(
+      id="task_literature",
+      name="文献整合",
+      description=(
+        "整合用户文献库中选定文献的分析结果，补充必要的研究空白识别。"
+        "优先使用用户文献，网络检索仅作补充并须标注来源。"
+      ),
+      agent_id="literature_researcher",
+      depends_on=["task_planning"],
+      output_format=OutputFormat.MARKDOWN,
+      output_template="""# 文献整合报告
+
+## 1. 用户文献库综述
+（按 [编号] 引用用户文献）
+## 2. 研究空白识别
+## 3. 创新方向建议
+## 4. 参考文献
+## 5. 文献数据库说明
+（区分用户文献库与网络检索来源）""",
+    ),
+    TaskDefinition(
+      id="task_experiment",
+      name="研究方法设计",
+      description="基于文献整合结果，设计详细研究方法。",
+      agent_id="experiment_designer",
+      depends_on=["task_planning", "task_literature"],
+      output_format=OutputFormat.MARKDOWN,
+    ),
+    TaskDefinition(
+      id="task_budget",
+      name="预算编制",
+      description="编制研究预算方案。",
+      agent_id="resource_analyst",
+      depends_on=["task_experiment"],
+      requires_human_review=True,
+      output_format=OutputFormat.MARKDOWN,
+    ),
+    *_domain_review_tasks(["task_planning", "task_literature", "task_experiment", "task_budget"]),
+    TaskDefinition(
+      id="task_review",
+      name="开题报告终审",
+      description="综合审查开题报告各章节，输出完整开题报告。",
+      agent_id="review_specialist",
+      depends_on=["task_planning", "task_literature", "task_experiment", "task_budget", *_DOMAIN_REVIEW_DEPS],
+      requires_human_review=True,
+      output_format=OutputFormat.MARKDOWN,
+      output_template="""# 开题报告（完整版）
+
+## 1. 研究背景
+## 2. 国内外研究现状
+## 3. 研究意义
+## 4. 研究目标与内容
+## 5. 研究方法
+## 6. 技术路线
+## 7. 预期成果与创新点
+## 8. 研究计划与进度安排
+## 9. 参考文献
+## 10. 文献数据库说明""",
+    ),
+  ],
 }

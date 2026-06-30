@@ -34,7 +34,10 @@ class Settings(BaseSettings):
     data_dir: Path = Path("./data")
     results_dir: Path = Path("./data/results")
     uploads_dir: Path = Path("./data/uploads")
+    literature_dir: Path = Path("./data/literature")
+    experiment_dir: Path = Path("./data/experiments")
     database_url: str = ""
+    literature_analysis_concurrency: int = 3
 
     # Semantic Scholar API Key（可选，可提高检索速率限制）
     semantic_scholar_api_key: str = ""
@@ -53,6 +56,8 @@ class Settings(BaseSettings):
         (PROJECT_ROOT / self.data_dir).mkdir(parents=True, exist_ok=True)
         (PROJECT_ROOT / self.results_dir).mkdir(parents=True, exist_ok=True)
         (PROJECT_ROOT / self.uploads_dir).mkdir(parents=True, exist_ok=True)
+        (PROJECT_ROOT / self.literature_dir).mkdir(parents=True, exist_ok=True)
+        (PROJECT_ROOT / self.experiment_dir).mkdir(parents=True, exist_ok=True)
 
 
 settings = Settings()

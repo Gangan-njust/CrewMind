@@ -12,7 +12,7 @@ from pathlib import Path
 import markdown
 from docx import Document
 from docx.oxml.ns import qn
-from docx.shared import Pt
+from docx.shared import Pt, RGBColor
 from htmldocx import HtmlToDocx
 from sqlalchemy import func, select
 
@@ -21,8 +21,105 @@ from backend.config import PROJECT_ROOT, settings
 from backend.storage.database import get_session, setup_database
 from backend.storage.models import TopicRecord, WorkflowRecord
 from backend.tasks.definitions import TASK_FLOWS
+from backend.utils.docx_tables import apply_black_fonts, apply_three_line_tables
+from backend.utils.text import sanitize_unicode, sanitize_deep
 
 logger = logging.getLogger(__name__)
+
+PROPOSAL_TASK_ID = "task_review"
+DOMAIN_REVIEW_TASK_IDS = frozenset({
+  "task_cs_review", "task_bio_review", "task_material_review",
+})
+PROPOSAL_SECTION_PATTERNS = (
+  r"完整工作方案\s*[（(]整合版[）)]",
+  r"开题报告\s*[（(]完整版[）)]",
+  r"完整开题报告",
+  r"整合(?:后的)?(?:完整)?(?:开题报告|工作方案|方案)",
+  r"完整工作方案",
+)
+REVIEW_REPORT_MARKERS = (
+  "终审报告", "质量评估", "主要优点", "存在问题", "改进建议", "录用建议",
+)
+
+
+def _looks_like_review_report(text: str) -> bool:
+  head = text[:3000]
+  hits = sum(1 for marker in REVIEW_REPORT_MARKERS if marker in head)
+  return hits >= 2 or ("终审报告" in head[:200])
+
+
+def _looks_like_proposal_document(text: str) -> bool:
+  head = text[:800].strip()
+  if _looks_like_review_report(text):
+    return False
+  proposal_markers = ("开题报告", "完整工作方案", "研究方案", "课题规划")
+  return any(marker in head for marker in proposal_markers)
+
+
+def _extract_markdown_section(text: str, heading_patterns: tuple[str, ...]) -> str | None:
+  for pattern in heading_patterns:
+    match = re.search(
+      rf"^(#{{1,3}})\s*(?:\d+\.\s*)?(?:{pattern})\s*$",
+      text,
+      re.MULTILINE,
+    )
+    if not match:
+      continue
+    # 整合版方案通常在终审报告末尾，后续子标题可能用 # 级别
+    section = text[match.end():].strip()
+    if section:
+      return section
+  return None
+
+
+def _compose_proposal_from_tasks(tasks: dict, task_order: list[str]) -> str | None:
+  parts: list[str] = []
+  for tid in task_order:
+    if tid == PROPOSAL_TASK_ID or tid in DOMAIN_REVIEW_TASK_IDS:
+      continue
+    task = tasks.get(tid)
+    output = (task or {}).get("output", "").strip()
+    if output:
+      parts.append(output)
+  if not parts:
+    return None
+  return "\n\n---\n\n".join(parts)
+
+
+def extract_proposal_output(
+  tasks: dict,
+  scenario: str,
+  task_order: list[str] | None = None,
+) -> str | None:
+  """提取开题报告/完整方案正文，跳过终审意见。"""
+  order = task_order or []
+  if not order:
+    try:
+      order = [t.id for t in TASK_FLOWS[ScenarioType(scenario)]]
+    except (ValueError, KeyError):
+      order = list(tasks.keys())
+
+  review_task = tasks.get(PROPOSAL_TASK_ID)
+  review_output = (review_task or {}).get("output", "").strip()
+  if review_output:
+    if _looks_like_proposal_document(review_output):
+      return review_output
+    if _looks_like_review_report(review_output):
+      section = _extract_markdown_section(review_output, PROPOSAL_SECTION_PATTERNS)
+      if section:
+        return section
+    else:
+      section = _extract_markdown_section(review_output, PROPOSAL_SECTION_PATTERNS)
+      if section:
+        return section
+
+  composed = _compose_proposal_from_tasks(tasks, order)
+  if composed:
+    return composed
+
+  if review_output and not _looks_like_review_report(review_output):
+    return review_output
+  return None
 
 TITLE_MAX_LENGTH = 80
 
@@ -148,12 +245,12 @@ def _markdown_to_latex(md: str) -> str:
 
 
 def normalize_user_input(text: str) -> str:
-  return re.sub(r"\s+", " ", text.strip()).lower()
+  return re.sub(r"\s+", " ", sanitize_unicode(text).strip()).lower()
 
 
 def compute_topic_key(user_input: str, scenario: str) -> str:
   raw = f"{scenario}::{normalize_user_input(user_input)}"
-  return hashlib.sha256(raw.encode()).hexdigest()[:32]
+  return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
 def generate_base_title(user_input: str, scenario: str) -> str:
@@ -212,6 +309,9 @@ class ResultStore:
   ) -> str:
     """保存工作方案，返回记录 ID"""
     self._ensure_legacy_migrated()
+    user_input = sanitize_unicode(user_input)
+    results = sanitize_deep(results)
+    metadata = sanitize_deep(metadata or {})
     record_id = str(uuid.uuid4())
     created_at = datetime.now()
     base_title = generate_base_title(user_input, scenario)
@@ -613,6 +713,27 @@ class ResultStore:
     }
     return self.build_markdown(record)
 
+  def build_proposal_markdown(self, record: dict) -> str:
+    output = extract_proposal_output(
+      record.get("tasks", {}),
+      record.get("scenario", ""),
+    )
+    if not output:
+      raise ValueError("未找到开题报告内容，请确认终审任务已完成")
+    return output.rstrip() + "\n"
+
+  def build_proposal_markdown_from_workflow(
+    self,
+    scenario: str,
+    user_input: str,
+    results: dict,
+    task_order: list[str] | None = None,
+  ) -> str:
+    output = extract_proposal_output(results, scenario, task_order)
+    if not output:
+      raise ValueError("未找到开题报告内容，请确认终审任务已完成")
+    return output.rstrip() + "\n"
+
   def build_latex(self, record: dict) -> str:
     scenario = record.get("scenario", "")
     scenario_label, task_names = self._resolve_scenario_meta(scenario)
@@ -685,6 +806,70 @@ class ResultStore:
     }
     return self.build_latex(record)
 
+  def build_proposal_latex(self, record: dict) -> str:
+    output = extract_proposal_output(
+      record.get("tasks", {}),
+      record.get("scenario", ""),
+    )
+    if not output:
+      raise ValueError("未找到开题报告内容，请确认终审任务已完成")
+
+    title = record.get("title") or "开题报告"
+    sections: list[str] = [
+      r"\documentclass[UTF8]{ctexart}",
+      r"\usepackage{hyperref}",
+      r"\usepackage{geometry}",
+      r"\geometry{a4paper, margin=2.5cm}",
+      r"\usepackage{verbatim}",
+      r"\usepackage{enumitem}",
+      "",
+      rf"\title{{{_escape_latex(title)}}}",
+      r"\date{}",
+      "",
+      r"\begin{document}",
+      r"\maketitle",
+      "",
+      _markdown_to_latex(output),
+      "",
+      r"\end{document}",
+      "",
+    ]
+    return "\n".join(sections)
+
+  def build_proposal_latex_from_workflow(
+    self,
+    scenario: str,
+    user_input: str,
+    results: dict,
+    title: str | None = None,
+    task_order: list[str] | None = None,
+  ) -> str:
+    output = extract_proposal_output(results, scenario, task_order)
+    if not output:
+      raise ValueError("未找到开题报告内容，请确认终审任务已完成")
+
+    doc_title = title or "开题报告"
+    sections: list[str] = [
+      r"\documentclass[UTF8]{ctexart}",
+      r"\usepackage{hyperref}",
+      r"\usepackage{geometry}",
+      r"\geometry{a4paper, margin=2.5cm}",
+      r"\usepackage{verbatim}",
+      r"\usepackage{enumitem}",
+      "",
+      rf"\title{{{_escape_latex(doc_title)}}}",
+      r"\date{}",
+      "",
+      r"\begin{document}",
+      r"\maketitle",
+      "",
+      _markdown_to_latex(output),
+      "",
+      r"\end{document}",
+      "",
+    ]
+    return "\n".join(sections)
+
   def build_docx(self, md_content: str) -> bytes:
     html = markdown.markdown(
       md_content,
@@ -693,15 +878,18 @@ class ResultStore:
     document = Document()
     self._configure_docx_styles(document)
     HtmlToDocx().add_html_to_document(html, document)
+    apply_three_line_tables(document)
+    apply_black_fonts(document)
     buffer = io.BytesIO()
     document.save(buffer)
     return buffer.getvalue()
 
-  def export_filename(self, scenario: str, ext: str) -> str:
+  def export_filename(self, scenario: str, ext: str, scope: str = "full") -> str:
     scenario_label, _ = self._resolve_scenario_meta(scenario)
     safe_label = "".join(c if c.isalnum() or c in "._-" else "_" for c in scenario_label)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"工作方案_{safe_label}_{timestamp}.{ext}"
+    prefix = "开题报告" if scope == "proposal" else "工作方案"
+    return f"{prefix}_{safe_label}_{timestamp}.{ext}"
 
   def _migrate_legacy_files(self) -> None:
     """将旧版 JSON 文件数据导入数据库（一次性）"""
@@ -827,9 +1015,11 @@ class ResultStore:
 
   @staticmethod
   def _configure_docx_styles(document: Document) -> None:
+    black = RGBColor(0, 0, 0)
     normal = document.styles["Normal"]
     normal.font.name = "Microsoft YaHei"
     normal.font.size = Pt(11)
+    normal.font.color.rgb = black
     normal._element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
 
     for style_name, size in [("Heading 1", 18), ("Heading 2", 15), ("Heading 3", 13)]:
@@ -837,6 +1027,7 @@ class ResultStore:
         heading = document.styles[style_name]
         heading.font.name = "Microsoft YaHei"
         heading.font.size = Pt(size)
+        heading.font.color.rgb = black
         heading._element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
 
   def _build_markdown(self, record: dict) -> str:

@@ -7,6 +7,8 @@ import httpx
 
 from backend.config import settings
 
+from backend.utils.text import sanitize_deep
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,12 +54,12 @@ class DeepSeekClient:
         selected_model = model or (
             settings.deepseek_reasoning_model if use_reasoning else self.model
         )
-        payload: dict[str, Any] = {
+        payload: dict[str, Any] = sanitize_deep({
             "model": selected_model,
             "messages": messages,
             "temperature": temperature if temperature is not None else self.temperature,
             "stream": stream,
-        }
+        })
 
         url = f"{self.base_url}/v1/chat/completions"
 

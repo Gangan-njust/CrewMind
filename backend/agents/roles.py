@@ -7,6 +7,7 @@ class ScenarioType(str, Enum):
   LITERATURE_REVIEW = "literature_review"
   EXPERIMENT_DESIGN = "experiment_design"
   FULL_PROPOSAL = "full_proposal"
+  LITERATURE_BASED_PROPOSAL = "literature_based_proposal"
 
 
 @dataclass
@@ -53,8 +54,10 @@ PLANNER = AgentRole(
   background=(
     "拥有15年科研项目管理经验，擅长将复杂研究课题分解为可执行的子任务。"
     "熟悉国家自然科学基金、省部级项目申报流程，精通研究方法论。"
+    "**撰写开题报告时，须优先引用用户提供的文献库内容，并在各章节标注引用来源。**"
   ),
-  goal="分析用户提出的研究需求，明确研究目标、范围和约束条件，输出结构化的课题规划框架。",
+  goal="分析用户提出的研究需求，明确研究目标、范围和约束条件，输出结构化的课题规划框架。"
+    "若上下文包含用户文献库，须将其作为核心依据整合进规划。",
   tools=["file_parser"],
 )
 
@@ -65,8 +68,11 @@ LITERATURE_RESEARCHER = AgentRole(
   background=(
     "图书馆学博士，精通文献检索策略与系统性综述方法。"
     "熟悉 Web of Science、PubMed、CNKI 等主流数据库，擅长识别研究空白与前沿趋势。"
+    "**当用户提供文献库时，必须优先引用用户文献库中的分析结果，不得忽视或替换为用户未提供的文献。**"
+    "网络检索仅作为补充，须在「文献数据库说明」中区分用户文献与网络来源。"
   ),
-  goal="基于课题规划，检索并分析相关文献，输出文献综述报告，识别研究空白和创新点。",
+  goal="基于课题规划，检索并分析相关文献，输出文献综述报告，识别研究空白和创新点。"
+    "若上下文包含用户文献库分析结果，须优先整合并标注引用来源。",
   tools=["web_search", "file_parser"],
 )
 
@@ -200,10 +206,15 @@ SCENARIO_AGENTS: dict[ScenarioType, list[str]] = {
     "planner", "experiment_designer", "resource_analyst", "review_specialist", *DOMAIN_REVIEWER_IDS,
   ],
   ScenarioType.FULL_PROPOSAL: list(ALL_AGENTS.keys()),
+  ScenarioType.LITERATURE_BASED_PROPOSAL: [
+    "planner", "literature_researcher", "experiment_designer",
+    "resource_analyst", "review_specialist", *DOMAIN_REVIEWER_IDS,
+  ],
 }
 
 SCENARIO_LABELS: dict[ScenarioType, str] = {
   ScenarioType.LITERATURE_REVIEW: "文献综述生成",
   ScenarioType.EXPERIMENT_DESIGN: "实验方案设计",
   ScenarioType.FULL_PROPOSAL: "完整工作方案",
+  ScenarioType.LITERATURE_BASED_PROPOSAL: "基于文献的开题报告",
 }

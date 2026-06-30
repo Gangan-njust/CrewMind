@@ -3,12 +3,13 @@ import logging
 from typing import Any
 
 from backend.agents.registry import get_agent_registry, list_agents
+from backend.utils.text import sanitize_unicode
 from backend.agents.roles import ScenarioType, SCENARIO_LABELS, SCENARIO_AGENTS
 from backend.crew.engine import Crew
 from backend.storage.results import result_store
 from backend.storage.uploads import upload_store
 from backend.tasks.definitions import TASK_FLOWS
-from backend.tasks.filtering import filter_tasks_by_agents
+from backend.tasks.filtering import apply_human_review_policy, filter_tasks_by_agents
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,7 @@ class WorkflowManager:
         if unknown:
           raise ValueError(f"未知 Agent 角色: {', '.join(unknown)}")
         tasks = filter_tasks_by_agents(tasks, selected_agents)
+        tasks = apply_human_review_policy(tasks, selected_agents)
         if not tasks:
           raise ValueError("所选 Agent 角色无法组成有效任务流程，请至少保留一个相关角色")
 
@@ -92,7 +94,7 @@ class WorkflowManager:
 
     crew = Crew(
       scenario=scenario,
-      user_input=user_input,
+      user_input=sanitize_unicode(user_input),
       user_id=user_id,
       topic_id=topic_id,
       reference_files=reference_files,

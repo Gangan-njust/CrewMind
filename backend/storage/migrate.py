@@ -6,7 +6,26 @@ from sqlalchemy import inspect, select, text
 from backend.auth import get_user_by_username, hash_password
 from backend.config import settings
 from backend.storage.database import Base, get_session
-from backend.storage.models import CustomAgentRecord, TopicRecord, User, WorkflowRecord, WorkflowTemplateRecord
+from backend.storage.models import (
+  CustomAgentRecord,
+  LiteratureAnalysisRecord,
+  LiteratureRecord,
+  TopicRecord,
+  User,
+  WorkflowRecord,
+  WorkflowTemplateRecord,
+  WorkspaceRecord,
+  WorkspaceSelectionRecord,
+  WritingProjectRecord,
+  WritingReferenceRecord,
+  WritingSectionRecord,
+  WritingSectionVersionRecord,
+  ExperimentRecord,
+  ExperimentEntryRecord,
+  ExperimentAttachmentRecord,
+  ExperimentDatasetRecord,
+  ExperimentAnalysisRecord,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,10 +88,113 @@ def run_migrations(engine) -> None:
       WorkflowTemplateRecord.__table__.create(bind=conn)
       logger.info("已创建 workflow_templates 表")
 
+    if not _table_exists(inspector, "workspaces"):
+      WorkspaceRecord.__table__.create(bind=conn)
+      logger.info("已创建 workspaces 表")
+
+    if not _table_exists(inspector, "literatures"):
+      LiteratureRecord.__table__.create(bind=conn)
+      logger.info("已创建 literatures 表")
+
+    if not _table_exists(inspector, "literature_analysis"):
+      LiteratureAnalysisRecord.__table__.create(bind=conn)
+      logger.info("已创建 literature_analysis 表")
+
+    if _table_exists(inspector, "literature_analysis") and not _column_exists(
+      inspector, "literature_analysis", "formulas_json"
+    ):
+      conn.execute(
+        text("ALTER TABLE literature_analysis ADD COLUMN formulas_json TEXT DEFAULT '[]'")
+      )
+      logger.info("已为 literature_analysis 添加 formulas_json 列")
+
+    if not _table_exists(inspector, "workspace_selections"):
+      WorkspaceSelectionRecord.__table__.create(bind=conn)
+      logger.info("已创建 workspace_selections 表")
+
+    if not _table_exists(inspector, "writing_projects"):
+      WritingProjectRecord.__table__.create(bind=conn)
+      logger.info("已创建 writing_projects 表")
+
+    if not _table_exists(inspector, "writing_sections"):
+      WritingSectionRecord.__table__.create(bind=conn)
+      logger.info("已创建 writing_sections 表")
+
+    if not _table_exists(inspector, "writing_section_versions"):
+      WritingSectionVersionRecord.__table__.create(bind=conn)
+      logger.info("已创建 writing_section_versions 表")
+
+    if not _table_exists(inspector, "writing_references"):
+      WritingReferenceRecord.__table__.create(bind=conn)
+      logger.info("已创建 writing_references 表")
+
+    if _table_exists(inspector, "writing_sections") and not _column_exists(
+      inspector, "writing_sections", "title"
+    ):
+      conn.execute(text("ALTER TABLE writing_sections ADD COLUMN title VARCHAR(256) DEFAULT ''"))
+      logger.info("已为 writing_sections 添加 title 列")
+
+    if _table_exists(inspector, "writing_sections") and not _column_exists(
+      inspector, "writing_sections", "sort_order"
+    ):
+      conn.execute(text("ALTER TABLE writing_sections ADD COLUMN sort_order INTEGER DEFAULT 0"))
+      logger.info("已为 writing_sections 添加 sort_order 列")
+
+    if _table_exists(inspector, "writing_sections") and not _column_exists(
+      inspector, "writing_sections", "is_custom"
+    ):
+      conn.execute(text("ALTER TABLE writing_sections ADD COLUMN is_custom BOOLEAN DEFAULT 0"))
+      logger.info("已为 writing_sections 添加 is_custom 列")
+
+    if not _table_exists(inspector, "experiments"):
+      ExperimentRecord.__table__.create(bind=conn)
+      logger.info("已创建 experiments 表")
+
+    if not _table_exists(inspector, "experiment_entries"):
+      ExperimentEntryRecord.__table__.create(bind=conn)
+      logger.info("已创建 experiment_entries 表")
+
+    if not _table_exists(inspector, "experiment_attachments"):
+      ExperimentAttachmentRecord.__table__.create(bind=conn)
+      logger.info("已创建 experiment_attachments 表")
+
+    if not _table_exists(inspector, "experiment_datasets"):
+      ExperimentDatasetRecord.__table__.create(bind=conn)
+      logger.info("已创建 experiment_datasets 表")
+
+    if not _table_exists(inspector, "experiment_analyses"):
+      ExperimentAnalysisRecord.__table__.create(bind=conn)
+      logger.info("已创建 experiment_analyses 表")
+
+  _backfill_writing_section_order()
   _ensure_admin_user()
   _migrate_existing_data_to_admin()
   _backfill_workflow_titles()
   _backfill_topics()
+
+
+def _backfill_writing_section_order() -> None:
+  """为已有章节回填 sort_order"""
+  from backend.storage.models import WritingProjectRecord, WritingSectionRecord
+  from backend.writing.templates import DEFAULT_SECTIONS
+
+  with get_session() as session:
+    projects = session.scalars(select(WritingProjectRecord)).all()
+    updated = 0
+    for project in projects:
+      sections = session.scalars(
+        select(WritingSectionRecord).where(WritingSectionRecord.project_id == project.id)
+      ).all()
+      order = DEFAULT_SECTIONS.get(project.paper_type, DEFAULT_SECTIONS["journal"])
+      for idx, sec in enumerate(
+        sorted(sections, key=lambda s: order.index(s.section_type) if s.section_type in order else 999)
+      ):
+        if sec.sort_order != idx:
+          sec.sort_order = idx
+          updated += 1
+    if updated:
+      session.commit()
+      logger.info("已为 %d 个章节回填 sort_order", updated)
 
 
 def _ensure_admin_user() -> User:

@@ -9,6 +9,7 @@ from backend.agents.roles import AgentRole
 from backend.llm.client import DeepSeekClient
 from backend.tasks.definitions import TaskDefinition, TaskStatus
 from backend.tools.registry import run_agent_tools
+from backend.utils.text import sanitize_deep
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +142,7 @@ class Crew:
 
   async def _emit(self, event_type: str, data: dict[str, Any]) -> None:
     if self._event_callback:
-      await self._event_callback(event_type, data)
+      await self._event_callback(event_type, sanitize_deep(data))
 
   async def _execute_agent(
     self,

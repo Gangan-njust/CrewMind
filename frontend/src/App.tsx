@@ -4,11 +4,14 @@ import {
   CheckCircle, Clock, AlertTriangle, XCircle, Loader,
   Sun, Moon, Pause, FileText, FileDown, FileCode, Upload, X,
   Plus, Pencil, Trash2, Settings, LogOut, User, Search,
-  GitCompare, Star, LayoutTemplate, Bookmark, CircleHelp,
+  GitCompare, Star, LayoutTemplate, Bookmark, CircleHelp, BookOpen, PenLine, FlaskConical,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { WorkflowVisualization } from './components/WorkflowVisualization'
+import { LiteratureAssistant } from './components/LiteratureAssistant'
+import { WritingAssistant } from './components/WritingAssistant'
+import { ExperimentManager } from './components/ExperimentManager'
 import {
   fetchScenarios, fetchAgents, startWorkflow, getWorkflowStatus,
   submitFeedback, suspendWorkflow, resumeWorkflow,
@@ -32,15 +35,189 @@ import {
 } from './templateUtils'
 import { HELP_SECTIONS } from './helpContent'
 
-type Page = 'dashboard' | 'workflow' | 'agents' | 'history' | 'help'
+type Page = 'dashboard' | 'workflow' | 'agents' | 'history' | 'literature' | 'writing' | 'experiment' | 'help'
 type Theme = 'dark' | 'light'
 
-const THEME_KEY = 'agentcrew-theme'
+const THEME_KEY = 'crewmind-theme'
 
 function getInitialTheme(): Theme {
   const saved = localStorage.getItem(THEME_KEY)
   if (saved === 'light' || saved === 'dark') return saved
   return 'dark'
+}
+
+type WorkflowWsSetters = {
+  setWorkflowStatus: React.Dispatch<React.SetStateAction<WorkflowStatus | null>>
+  setReviewTaskId: React.Dispatch<React.SetStateAction<string>>
+  setIsRunning: React.Dispatch<React.SetStateAction<boolean>>
+  setToolEvents: React.Dispatch<React.SetStateAction<{ tool: string; status: string; detail: string }[]>>
+}
+
+function syncReviewFromStatus(
+  status: WorkflowStatus,
+  setReviewTaskId: WorkflowWsSetters['setReviewTaskId'],
+  setIsRunning: WorkflowWsSetters['setIsRunning'],
+) {
+  if (status.status !== 'paused') return
+  const waiting = Object.entries(status.results).find(([, r]) => r.status === 'waiting_human')
+  if (waiting) {
+    setReviewTaskId(waiting[0])
+    setIsRunning(false)
+  }
+}
+
+function handleWorkflowWebSocketMessage(
+  crewId: string,
+  msg: Record<string, unknown>,
+  setters: WorkflowWsSetters,
+) {
+  const { setWorkflowStatus, setReviewTaskId, setIsRunning, setToolEvents } = setters
+
+  if (msg.type === 'task_output_chunk') {
+    setWorkflowStatus(prev => {
+      if (!prev) return prev
+      const taskId = msg.task_id as string
+      const prevResult = prev.results[taskId] || { status: 'running', output: '', error: '', human_feedback: '' }
+      if (prevResult.status === 'waiting_human') return prev
+      return {
+        ...prev,
+        results: {
+          ...prev.results,
+          [taskId]: {
+            ...prevResult,
+            status: 'running',
+            output: (prevResult.output || '') + (msg.chunk || ''),
+          },
+        },
+      }
+    })
+    return
+  }
+
+  if (msg.type === 'tool_invoked') {
+    setToolEvents(prev => [
+      ...prev,
+      {
+        tool: msg.tool as string,
+        status: msg.status as string,
+        detail: (msg.detail as string) || '',
+      },
+    ])
+    return
+  }
+
+  if (msg.type === 'task_started') {
+    setWorkflowStatus(prev => {
+      if (!prev) return prev
+      const taskId = msg.task_id as string
+      return {
+        ...prev,
+        results: {
+          ...prev.results,
+          [taskId]: { status: 'running', output: '', error: '', human_feedback: '' },
+        },
+      }
+    })
+    return
+  }
+
+  if (msg.type === 'task_resumed') {
+    setWorkflowStatus(prev => {
+      if (!prev) return prev
+      const taskId = msg.task_id as string
+      const prevResult = prev.results[taskId] || { status: 'running', output: '', error: '', human_feedback: '' }
+      return {
+        ...prev,
+        status: 'running',
+        results: {
+          ...prev.results,
+          [taskId]: {
+            ...prevResult,
+            status: 'running',
+            output: (msg.output as string) ?? prevResult.output,
+          },
+        },
+      }
+    })
+    return
+  }
+
+  if (msg.type === 'human_review_required') {
+    const taskId = msg.task_id as string
+    setReviewTaskId(taskId)
+    setIsRunning(false)
+    setWorkflowStatus(prev => {
+      if (!prev) return prev
+      const prevResult = prev.results[taskId] || { status: 'waiting_human', output: '', error: '', human_feedback: '' }
+      return {
+        ...prev,
+        status: 'paused',
+        results: {
+          ...prev.results,
+          [taskId]: {
+            ...prevResult,
+            status: 'waiting_human',
+            output: (msg.output as string) || prevResult.output,
+          },
+        },
+      }
+    })
+    getWorkflowStatus(crewId).then(status => {
+      setWorkflowStatus(status)
+      syncReviewFromStatus(status, setReviewTaskId, setIsRunning)
+    })
+    return
+  }
+
+  if (msg.type === 'task_completed' || msg.type === 'status') {
+    getWorkflowStatus(crewId).then(status => {
+      setWorkflowStatus(status)
+      syncReviewFromStatus(status, setReviewTaskId, setIsRunning)
+    })
+    return
+  }
+
+  if (msg.type === 'crew_completed') {
+    setIsRunning(false)
+    getWorkflowStatus(crewId).then(setWorkflowStatus)
+    return
+  }
+
+  if (msg.type === 'crew_failed') {
+    setIsRunning(false)
+    setWorkflowStatus(prev => prev ? { ...prev, status: 'failed' } : prev)
+    return
+  }
+
+  if (msg.type === 'crew_suspended') {
+    setIsRunning(false)
+    getWorkflowStatus(crewId).then(setWorkflowStatus)
+    return
+  }
+
+  if (msg.type === 'crew_resumed') {
+    setIsRunning(true)
+    setReviewTaskId('')
+    setWorkflowStatus(prev => prev ? { ...prev, status: 'running' } : prev)
+  }
+}
+
+function startWorkflowStatusPoll(crewId: string, setters: WorkflowWsSetters) {
+  const { setWorkflowStatus, setReviewTaskId, setIsRunning } = setters
+  const poll = setInterval(async () => {
+    try {
+      const status = await getWorkflowStatus(crewId)
+      setWorkflowStatus(status)
+      if (status.status === 'completed' || status.status === 'failed' || status.status === 'suspended') {
+        clearInterval(poll)
+        setIsRunning(false)
+      }
+      syncReviewFromStatus(status, setReviewTaskId, setIsRunning)
+    } catch {
+      clearInterval(poll)
+    }
+  }, 2000)
+  return poll
 }
 
 export default function App() {
@@ -72,6 +249,8 @@ export default function App() {
   const [activeTemplate, setActiveTemplate] = useState<WorkflowTemplate | null>(null)
   const [templateVariableValues, setTemplateVariableValues] = useState<Record<string, string>>({})
   const [showSaveTemplate, setShowSaveTemplate] = useState(false)
+  const [writingFromRecordId, setWritingFromRecordId] = useState<string | null>(null)
+  const [experimentFromRecordId, setExperimentFromRecordId] = useState<string | null>(null)
 
   const loadAppData = () => {
     fetchScenarios().then(setScenarios).catch(() => {})
@@ -113,6 +292,11 @@ export default function App() {
     document.documentElement.setAttribute('data-theme', theme)
     localStorage.setItem(THEME_KEY, theme)
   }, [theme])
+
+  useEffect(() => {
+    if (!workflowStatus) return
+    syncReviewFromStatus(workflowStatus, setReviewTaskId, setIsRunning)
+  }, [workflowStatus])
 
   useEffect(() => {
     if (!showSettings) return
@@ -281,107 +465,14 @@ export default function App() {
       })
       setPage('workflow')
 
-      connectWebSocket(data.crew_id, (msg) => {
-        if (msg.type === 'task_output_chunk') {
-          setWorkflowStatus(prev => {
-            if (!prev) return prev
-            const taskId = msg.task_id as string
-            const prevResult = prev.results[taskId] || { status: 'running', output: '', error: '', human_feedback: '' }
-            return {
-              ...prev,
-              results: {
-                ...prev.results,
-                [taskId]: {
-                  ...prevResult,
-                  status: 'running',
-                  output: (prevResult.output || '') + (msg.chunk || ''),
-                },
-              },
-            }
-          })
-        }
-        if (msg.type === 'tool_invoked') {
-          setToolEvents(prev => [
-            ...prev,
-            {
-              tool: msg.tool as string,
-              status: msg.status as string,
-              detail: msg.detail as string,
-            },
-          ])
-        }
-        if (msg.type === 'task_started') {
-          setWorkflowStatus(prev => {
-            if (!prev) return prev
-            const taskId = msg.task_id as string
-            return {
-              ...prev,
-              results: {
-                ...prev.results,
-                [taskId]: {
-                  status: 'running',
-                  output: '',
-                  error: '',
-                  human_feedback: '',
-                },
-              },
-            }
-          })
-        }
-        if (msg.type === 'task_resumed') {
-          setWorkflowStatus(prev => {
-            if (!prev) return prev
-            const taskId = msg.task_id as string
-            const prevResult = prev.results[taskId] || { status: 'running', output: '', error: '', human_feedback: '' }
-            return {
-              ...prev,
-              status: 'running',
-              results: {
-                ...prev.results,
-                [taskId]: {
-                  ...prevResult,
-                  status: 'running',
-                  output: msg.output ?? prevResult.output,
-                },
-              },
-            }
-          })
-        }
-        if (msg.type === 'task_completed' || msg.type === 'human_review_required' ||
-            msg.type === 'crew_completed' || msg.type === 'status') {
-          getWorkflowStatus(data.crew_id).then(setWorkflowStatus)
-        }
-        if (msg.type === 'human_review_required') {
-          setReviewTaskId(msg.task_id)
-        }
-        if (msg.type === 'crew_completed' || msg.type === 'crew_failed') {
-          setIsRunning(false)
-        }
-        if (msg.type === 'crew_suspended') {
-          setIsRunning(false)
-          getWorkflowStatus(data.crew_id).then(setWorkflowStatus)
-        }
-        if (msg.type === 'crew_resumed') {
-          setIsRunning(true)
-          setWorkflowStatus(prev => prev ? { ...prev, status: 'running' } : prev)
-        }
-      })
-
-      // Poll status as fallback
-      const poll = setInterval(async () => {
-        const status = await getWorkflowStatus(data.crew_id)
-        setWorkflowStatus(status)
-        if (status.status === 'completed' || status.status === 'failed' || status.status === 'suspended') {
-          clearInterval(poll)
-          setIsRunning(false)
-        }
-        if (status.status === 'paused') {
-          const waiting = Object.entries(status.results).find(
-            ([, r]) => r.status === 'waiting_human'
-          )
-          if (waiting) setReviewTaskId(waiting[0])
-        }
-      }, 2000)
+      const wsSetters: WorkflowWsSetters = {
+        setWorkflowStatus,
+        setReviewTaskId,
+        setIsRunning,
+        setToolEvents,
+      }
+      connectWebSocket(data.crew_id, (msg) => handleWorkflowWebSocketMessage(data.crew_id, msg, wsSetters))
+      startWorkflowStatusPoll(data.crew_id, wsSetters)
     } catch (e: any) {
       alert(e.message)
       setIsRunning(false)
@@ -425,6 +516,43 @@ export default function App() {
 
   const currentScenario = activeWorkflowScenario || scenarios.find(s => s.id === selectedScenario)
 
+  const handleLiteratureWorkflowStart = async (newCrewId: string) => {
+    setIsRunning(true)
+    setToolEvents([])
+    setCrewId(newCrewId)
+    try {
+      const status = await getWorkflowStatus(newCrewId)
+      setWorkflowStatus(status)
+      setActiveCollaborationMode(status.collaboration_mode || 'sequential')
+      const tasks = (status.tasks || []).map(t => ({
+        id: t.id,
+        name: t.name,
+        agent_id: t.agent_id,
+        depends_on: t.depends_on,
+        requires_human_review: t.requires_human_review ?? false,
+      }))
+      setActiveWorkflowScenario({
+        id: status.scenario,
+        label: scenarios.find(s => s.id === status.scenario)?.label || status.scenario,
+        agents: agents.filter(a => tasks.some(t => t.agent_id === a.id)),
+        tasks,
+      })
+      setPage('workflow')
+      const wsSetters: WorkflowWsSetters = {
+        setWorkflowStatus,
+        setReviewTaskId,
+        setIsRunning,
+        setToolEvents,
+      }
+      connectWebSocket(newCrewId, (msg) => handleWorkflowWebSocketMessage(newCrewId, msg, wsSetters))
+      startWorkflowStatusPoll(newCrewId, wsSetters)
+      syncReviewFromStatus(status, setReviewTaskId, setIsRunning)
+    } catch (e: any) {
+      alert(e.message)
+      setIsRunning(false)
+    }
+  }
+
   const toggleAgent = (agentId: string) => {
     setSelectedAgents(prev =>
       prev.includes(agentId)
@@ -439,8 +567,8 @@ export default function App() {
         <div className="app-header">
           <Bot size={28} color="#a29bfe" />
           <div>
-            <h1>AgentCrew</h1>
-            <div className="subtitle">多智能体工作方案系统</div>
+            <h1>CrewMind</h1>
+            <div className="subtitle">智能科研协作平台</div>
           </div>
         </div>
 
@@ -459,6 +587,18 @@ export default function App() {
         <button className={`nav-item ${page === 'history' ? 'active' : ''}`}
           onClick={() => setPage('history')}>
           <History size={18} /> 历史方案
+        </button>
+        <button className={`nav-item ${page === 'literature' ? 'active' : ''}`}
+          onClick={() => setPage('literature')}>
+          <BookOpen size={18} /> 文献助手
+        </button>
+        <button className={`nav-item ${page === 'writing' ? 'active' : ''}`}
+          onClick={() => setPage('writing')}>
+          <PenLine size={18} /> 学术写作
+        </button>
+        <button className={`nav-item ${page === 'experiment' ? 'active' : ''}`}
+          onClick={() => setPage('experiment')}>
+          <FlaskConical size={18} /> 实验数据
         </button>
         <button className={`nav-item ${page === 'help' ? 'active' : ''}`}
           onClick={() => setPage('help')}>
@@ -489,6 +629,7 @@ export default function App() {
       </aside>
 
       <main className="main-content">
+        <div key={page} className="page-content">
         {page === 'dashboard' && (
           <DashboardPage
             scenarios={scenarios}
@@ -562,6 +703,14 @@ export default function App() {
         {page === 'history' && (
           <HistoryPage
             onRegenerateVersion={handleRegenerateVersion}
+            onCreateWriting={(recordId) => {
+              setWritingFromRecordId(recordId)
+              setPage('writing')
+            }}
+            onCreateExperiment={(recordId) => {
+              setExperimentFromRecordId(recordId)
+              setPage('experiment')
+            }}
             onSaveAsTemplate={async (topic: TopicRecord, agents: string[]) => {
               const name = prompt('模板名称', topic.title || '我的方案模板')
               if (!name?.trim()) return
@@ -584,6 +733,24 @@ export default function App() {
         )}
 
         {page === 'help' && <HelpPage />}
+
+        {page === 'literature' && (
+          <LiteratureAssistant onStartWorkflow={handleLiteratureWorkflowStart} />
+        )}
+
+        {page === 'writing' && (
+          <WritingAssistant
+            workflowRecordId={writingFromRecordId}
+            onProjectReady={() => setWritingFromRecordId(null)}
+          />
+        )}
+
+        {page === 'experiment' && (
+          <ExperimentManager
+            workflowRecordId={experimentFromRecordId}
+          />
+        )}
+        </div>
       </main>
     </div>
   )
@@ -637,8 +804,8 @@ function LoginPage({
       <div className="auth-card">
         <div className="auth-header">
           <Bot size={36} color="#a29bfe" />
-          <h1>AgentCrew</h1>
-          <p>多智能体工作方案系统</p>
+          <h1>CrewMind</h1>
+          <p>智能科研协作平台</p>
         </div>
 
         <div className="auth-tabs">
@@ -1144,12 +1311,14 @@ function DashboardPage({
 /* ── Export Buttons ─────────────────────────────────────────── */
 
 function ExportButtons({ crewId, recordId }: { crewId?: string; recordId?: string }) {
-  const [exporting, setExporting] = useState<'md' | 'docx' | 'tex' | null>(null)
+  type ExportKey = `${'full' | 'proposal'}-${'md' | 'docx' | 'tex'}`
+  const [exporting, setExporting] = useState<ExportKey | null>(null)
 
-  const handleExport = async (format: 'md' | 'docx' | 'tex') => {
-    setExporting(format)
+  const handleExport = async (format: 'md' | 'docx' | 'tex', scope: 'full' | 'proposal' = 'full') => {
+    const key: ExportKey = `${scope}-${format}`
+    setExporting(key)
     try {
-      await downloadExport({ format, crewId, recordId })
+      await downloadExport({ format, crewId, recordId, scope })
     } catch (e: any) {
       alert(e.message || '导出失败')
     } finally {
@@ -1157,33 +1326,50 @@ function ExportButtons({ crewId, recordId }: { crewId?: string; recordId?: strin
     }
   }
 
+  const renderFormatButtons = (scope: 'full' | 'proposal', labels: { md: string; docx: string; tex: string }) => (
+    <>
+      <button
+        className="btn btn-outline"
+        onClick={() => handleExport('md', scope)}
+        disabled={!!exporting}
+      >
+        {exporting === `${scope}-md` ? <Loader size={16} className="spinner" /> : <FileText size={16} />}
+        {labels.md}
+      </button>
+      <button
+        className="btn btn-outline"
+        onClick={() => handleExport('docx', scope)}
+        disabled={!!exporting}
+      >
+        {exporting === `${scope}-docx` ? <Loader size={16} className="spinner" /> : <FileDown size={16} />}
+        {labels.docx}
+      </button>
+      <button
+        className="btn btn-outline"
+        onClick={() => handleExport('tex', scope)}
+        disabled={!!exporting}
+      >
+        {exporting === `${scope}-tex` ? <Loader size={16} className="spinner" /> : <FileCode size={16} />}
+        {labels.tex}
+      </button>
+    </>
+  )
+
   return (
     <div className="export-toolbar">
       <span className="export-label">导出方案</span>
-      <button
-        className="btn btn-outline"
-        onClick={() => handleExport('md')}
-        disabled={!!exporting}
-      >
-        {exporting === 'md' ? <Loader size={16} className="spinner" /> : <FileText size={16} />}
-        导出 Markdown
-      </button>
-      <button
-        className="btn btn-outline"
-        onClick={() => handleExport('docx')}
-        disabled={!!exporting}
-      >
-        {exporting === 'docx' ? <Loader size={16} className="spinner" /> : <FileDown size={16} />}
-        导出 Word
-      </button>
-      <button
-        className="btn btn-outline"
-        onClick={() => handleExport('tex')}
-        disabled={!!exporting}
-      >
-        {exporting === 'tex' ? <Loader size={16} className="spinner" /> : <FileCode size={16} />}
-        导出 LaTeX
-      </button>
+      {renderFormatButtons('full', {
+        md: 'Markdown',
+        docx: 'Word',
+        tex: 'LaTeX',
+      })}
+      <span className="export-divider" />
+      <span className="export-label">仅开题报告</span>
+      {renderFormatButtons('proposal', {
+        md: 'Markdown',
+        docx: 'Word',
+        tex: 'LaTeX',
+      })}
     </div>
   )
 }
@@ -1554,7 +1740,7 @@ function HelpPage() {
     <div className="help-layout">
       <nav className="help-nav">
         <h2 className="help-nav-title">使用帮助</h2>
-        <p className="help-nav-desc">快速了解 AgentCrew 的使用方法</p>
+        <p className="help-nav-desc">快速了解 CrewMind 的使用方法</p>
         <ul className="help-nav-list">
           {HELP_SECTIONS.map(section => (
             <li key={section.id}>
@@ -1706,10 +1892,14 @@ function CompareView({
 function HistoryPage({
   onRegenerateVersion,
   onSaveAsTemplate,
+  onCreateWriting,
+  onCreateExperiment,
   scenarios,
 }: {
   onRegenerateVersion: (topic: TopicRecord) => void
   onSaveAsTemplate: (topic: TopicRecord, agents: string[]) => void
+  onCreateWriting: (recordId: string) => void
+  onCreateExperiment: (recordId: string) => void
   scenarios: Scenario[]
 }) {
   const [view, setView] = useState<HistoryView>('topics')
@@ -1722,6 +1912,8 @@ function HistoryPage({
   const [comparison, setComparison] = useState<CompareResult | null>(null)
   const [searching, setSearching] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [creatingWriting, setCreatingWriting] = useState(false)
+  const [creatingExperiment, setCreatingExperiment] = useState(false)
 
   const loadTopics = async (search?: string) => {
     setSearching(true)
@@ -1822,7 +2014,37 @@ function HistoryPage({
           {selectedRecord.version_number && (
             <span className="version-badge">v{selectedRecord.version_number}</span>
           )}
-          <div style={{ marginLeft: 'auto' }}>
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+            <button
+              className="btn btn-primary"
+              disabled={creatingWriting}
+              onClick={async () => {
+                setCreatingWriting(true)
+                try {
+                  onCreateWriting(selectedRecord.id)
+                } finally {
+                  setCreatingWriting(false)
+                }
+              }}
+            >
+              {creatingWriting ? <Loader size={16} className="spinner" /> : <PenLine size={16} />}
+              创建写作项目
+            </button>
+            <button
+              className="btn btn-secondary"
+              disabled={creatingExperiment}
+              onClick={async () => {
+                setCreatingExperiment(true)
+                try {
+                  onCreateExperiment(selectedRecord.id)
+                } finally {
+                  setCreatingExperiment(false)
+                }
+              }}
+            >
+              {creatingExperiment ? <Loader size={16} className="spinner" /> : <FlaskConical size={16} />}
+              创建实验项目
+            </button>
             <ExportButtons recordId={selectedRecord.id} />
           </div>
         </div>

@@ -52,8 +52,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-  title="多智能体工作方案系统",
-  description="基于多 Agent 协作的科研工作方案制定平台",
+  title="CrewMind API",
+  description="CrewMind · 智能科研协作平台 — 面向高校课题组与科研团队的多智能体协作平台",
   version="1.0.0",
   lifespan=lifespan,
 )
@@ -379,21 +379,14 @@ async def start_workflow(req: StartWorkflowRequest, current_user: User = Depends
 
   asyncio.create_task(run_crew())
 
+  from backend.tasks.filtering import serialize_tasks
+
   return {
     "crew_id": crew.id,
     "scenario": crew.scenario,
     "collaboration_mode": crew.collaboration_mode,
     "status": "started",
-    "tasks": [
-      {
-        "id": t.id,
-        "name": t.name,
-        "agent_id": t.agent_id,
-        "depends_on": t.depends_on,
-        "requires_human_review": t.requires_human_review,
-      }
-      for t in crew.tasks
-    ],
+    "tasks": serialize_tasks(crew.tasks),
   }
 
 
@@ -402,6 +395,8 @@ async def get_workflow_status(crew_id: str, current_user: User = Depends(get_cur
   crew = workflow_manager.get_crew(crew_id, current_user.id)
   if not crew:
     raise HTTPException(404, "工作流不存在")
+  from backend.tasks.filtering import serialize_tasks
+
   return {
     "crew_id": crew.id,
     "scenario": crew.scenario,
@@ -409,6 +404,7 @@ async def get_workflow_status(crew_id: str, current_user: User = Depends(get_cur
     "status": crew.status,
     "user_input": crew.user_input,
     "results": crew._serialize_results(),
+    "tasks": serialize_tasks(crew.tasks),
   }
 
 
@@ -532,43 +528,71 @@ async def get_result(record_id: str, current_user: User = Depends(get_current_us
 async def export_result(
   record_id: str,
   format: str = Query("md", pattern="^(md|docx|tex)$"),
+  scope: str = Query("full", pattern="^(full|proposal)$"),
   current_user: User = Depends(get_current_user),
 ):
   record = result_store.get(record_id, current_user.id)
   if not record:
     raise HTTPException(404, "记录不存在")
 
-  filename = result_store.export_filename(record["scenario"], format)
+  filename = result_store.export_filename(record["scenario"], format, scope)
 
-  if format == "md":
+  try:
+    if scope == "proposal":
+      if format == "md":
+        content = result_store.build_proposal_markdown(record)
+        return Response(
+          content=content.encode("utf-8"),
+          media_type="text/markdown; charset=utf-8",
+          headers=_attachment_headers(filename),
+        )
+      if format == "tex":
+        content = result_store.build_proposal_latex(record)
+        return Response(
+          content=content.encode("utf-8"),
+          media_type="application/x-tex; charset=utf-8",
+          headers=_attachment_headers(filename),
+        )
+      md_content = result_store.build_proposal_markdown(record)
+      docx_bytes = result_store.build_docx(md_content)
+      return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers=_attachment_headers(filename),
+      )
+
+    if format == "md":
+      md_content = result_store.build_markdown(record)
+      return Response(
+        content=md_content.encode("utf-8"),
+        media_type="text/markdown; charset=utf-8",
+        headers=_attachment_headers(filename),
+      )
+
+    if format == "tex":
+      tex_content = result_store.build_latex(record)
+      return Response(
+        content=tex_content.encode("utf-8"),
+        media_type="application/x-tex; charset=utf-8",
+        headers=_attachment_headers(filename),
+      )
+
     md_content = result_store.build_markdown(record)
+    docx_bytes = result_store.build_docx(md_content)
     return Response(
-      content=md_content.encode("utf-8"),
-      media_type="text/markdown; charset=utf-8",
+      content=docx_bytes,
+      media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       headers=_attachment_headers(filename),
     )
-
-  if format == "tex":
-    tex_content = result_store.build_latex(record)
-    return Response(
-      content=tex_content.encode("utf-8"),
-      media_type="application/x-tex; charset=utf-8",
-      headers=_attachment_headers(filename),
-    )
-
-  md_content = result_store.build_markdown(record)
-  docx_bytes = result_store.build_docx(md_content)
-  return Response(
-    content=docx_bytes,
-    media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    headers=_attachment_headers(filename),
-  )
+  except ValueError as e:
+    raise HTTPException(400, str(e))
 
 
 @app.get("/api/workflow/{crew_id}/export")
 async def export_workflow(
   crew_id: str,
   format: str = Query("md", pattern="^(md|docx|tex)$"),
+  scope: str = Query("full", pattern="^(full|proposal)$"),
   current_user: User = Depends(get_current_user),
 ):
   crew = workflow_manager.get_crew(crew_id, current_user.id)
@@ -577,43 +601,86 @@ async def export_workflow(
   if crew.status not in ("completed", "failed"):
     raise HTTPException(400, "工作流尚未完成，暂无法导出")
 
-  filename = result_store.export_filename(crew.scenario, format)
+  filename = result_store.export_filename(crew.scenario, format, scope)
+  results = crew._serialize_results()
+  task_order = [t.id for t in crew.tasks]
 
-  if format == "md":
+  try:
+    if scope == "proposal":
+      if format == "md":
+        content = result_store.build_proposal_markdown_from_workflow(
+          scenario=crew.scenario,
+          user_input=crew.user_input,
+          results=results,
+          task_order=task_order,
+        )
+        return Response(
+          content=content.encode("utf-8"),
+          media_type="text/markdown; charset=utf-8",
+          headers=_attachment_headers(filename),
+        )
+      if format == "tex":
+        content = result_store.build_proposal_latex_from_workflow(
+          scenario=crew.scenario,
+          user_input=crew.user_input,
+          results=results,
+          task_order=task_order,
+        )
+        return Response(
+          content=content.encode("utf-8"),
+          media_type="application/x-tex; charset=utf-8",
+          headers=_attachment_headers(filename),
+        )
+      md_content = result_store.build_proposal_markdown_from_workflow(
+        scenario=crew.scenario,
+        user_input=crew.user_input,
+        results=results,
+        task_order=task_order,
+      )
+      docx_bytes = result_store.build_docx(md_content)
+      return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers=_attachment_headers(filename),
+      )
+
+    if format == "md":
+      md_content = result_store.build_markdown_from_workflow(
+        scenario=crew.scenario,
+        user_input=crew.user_input,
+        results=results,
+      )
+      return Response(
+        content=md_content.encode("utf-8"),
+        media_type="text/markdown; charset=utf-8",
+        headers=_attachment_headers(filename),
+      )
+
+    if format == "tex":
+      tex_content = result_store.build_latex_from_workflow(
+        scenario=crew.scenario,
+        user_input=crew.user_input,
+        results=results,
+      )
+      return Response(
+        content=tex_content.encode("utf-8"),
+        media_type="application/x-tex; charset=utf-8",
+        headers=_attachment_headers(filename),
+      )
+
     md_content = result_store.build_markdown_from_workflow(
       scenario=crew.scenario,
       user_input=crew.user_input,
-      results=crew._serialize_results(),
+      results=results,
     )
+    docx_bytes = result_store.build_docx(md_content)
     return Response(
-      content=md_content.encode("utf-8"),
-      media_type="text/markdown; charset=utf-8",
+      content=docx_bytes,
+      media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       headers=_attachment_headers(filename),
     )
-
-  if format == "tex":
-    tex_content = result_store.build_latex_from_workflow(
-      scenario=crew.scenario,
-      user_input=crew.user_input,
-      results=crew._serialize_results(),
-    )
-    return Response(
-      content=tex_content.encode("utf-8"),
-      media_type="application/x-tex; charset=utf-8",
-      headers=_attachment_headers(filename),
-    )
-
-  md_content = result_store.build_markdown_from_workflow(
-    scenario=crew.scenario,
-    user_input=crew.user_input,
-    results=crew._serialize_results(),
-  )
-  docx_bytes = result_store.build_docx(md_content)
-  return Response(
-    content=docx_bytes,
-    media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    headers=_attachment_headers(filename),
-  )
+  except ValueError as e:
+    raise HTTPException(400, str(e))
 
 
 @app.post("/api/results/compare")
@@ -622,6 +689,27 @@ async def compare_results(req: CompareRequest, current_user: User = Depends(get_
     return result_store.compare(req.record_id_a, req.record_id_b, current_user.id)
   except ValueError as e:
     raise HTTPException(400, str(e))
+
+
+# ── 智能文献阅读助手 API ───────────────────────────────────────
+
+from backend.routes.literature import (
+  register_literature_websocket,
+  register_proposal_route,
+  router as literature_router,
+)
+
+app.include_router(literature_router)
+register_proposal_route(app, workflow_manager, ws_manager, _attach_event_callback, _finalize_crew)
+register_literature_websocket(app)
+
+from backend.routes.writing import router as writing_router
+
+app.include_router(writing_router)
+
+from backend.routes.experiment import router as experiment_router
+
+app.include_router(experiment_router)
 
 
 # ── WebSocket 实时事件 ─────────────────────────────────────────

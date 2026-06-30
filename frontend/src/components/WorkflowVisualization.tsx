@@ -273,7 +273,7 @@ function TaskOutputCard({
   reviewPanel?: React.ReactNode
 }) {
   const status = result?.status || 'pending'
-  const hasContent = !!(result?.output || result?.error || status === 'running' || status === 'suspended')
+  const hasContent = !!(result?.output || result?.error || status === 'running' || status === 'suspended' || status === 'waiting_human')
   const color = agentColor(task.agent_id)
 
   return (
@@ -323,12 +323,18 @@ function TaskOutputCard({
             </div>
           ) : status === 'pending' ? (
             <div className="task-output-placeholder">等待前序任务完成...</div>
+          ) : status === 'waiting_human' && !result?.output ? (
+            <div className="task-output-placeholder">生成已完成，请在下方的审核面板中确认。</div>
           ) : null}
 
           {result?.error && (
             <div className="task-output-error">错误: {result.error}</div>
           )}
+        </div>
+      )}
 
+      {reviewPanel && (
+        <div className="task-output-body task-output-review">
           {reviewPanel}
         </div>
       )}
@@ -451,7 +457,7 @@ export function WorkflowVisualization({
             {tasks.map(task => {
               const result = results[task.id]
               const status = result?.status || 'pending'
-              const isReview = status === 'waiting_human' && task.id === reviewTaskId
+              const isReview = !!reviewTaskId && task.id === reviewTaskId && !!onReview
 
               return (
                 <TaskOutputCard
@@ -466,7 +472,7 @@ export function WorkflowVisualization({
                     <div className="review-panel">
                       <h4>人工审核</h4>
                       <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 8 }}>
-                        请审核上述输出，可以输入修改意见后批准，或直接驳回。
+                        请审核上述输出。无修改意见时点击「批准并继续」将直接采用当前内容，不会重新生成。
                       </p>
                       <textarea
                         className="form-textarea"

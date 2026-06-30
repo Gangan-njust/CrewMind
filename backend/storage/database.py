@@ -27,10 +27,14 @@ def setup_database() -> None:
 
   from backend.storage.models import (  # noqa: F401
     CustomAgentRecord,
+    LiteratureAnalysisRecord,
+    LiteratureRecord,
     TopicRecord,
     User,
     WorkflowRecord,
     WorkflowTemplateRecord,
+    WorkspaceRecord,
+    WorkspaceSelectionRecord,
   )
 
   Base.metadata.create_all(bind=_engine)
