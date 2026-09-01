@@ -25,6 +25,45 @@ LENGTH_LABELS = {
 }
 POLISH_LABELS = {"conservative": "保守润色", "moderate": "中等润色", "deep": "深度润色"}
 
+SECTION_TYPE_TO_KEYS: dict[str, list[str]] = {
+  "intro": ["introduction", "preamble", "abstract"],
+  "methods": ["methods"],
+  "results": ["results"],
+  "discussion": ["discussion", "results"],
+  "conclusion": ["conclusion", "discussion"],
+  "related_work": ["introduction", "methods", "discussion"],
+}
+
+
+def _infer_section_keys(section_type: str) -> list[str] | None:
+  return SECTION_TYPE_TO_KEYS.get(section_type)
+
+
+def _fetch_rag_context(
+  workspace_id: str | None,
+  query: str,
+  section_type: str,
+) -> tuple[str, int]:
+  if not workspace_id:
+    return "", 0
+  from backend.config import settings as app_settings
+  if not app_settings.rag_enabled:
+    return "", 0
+  try:
+    from backend.rag.context_builder import build_rag_context
+    from backend.rag.retriever import retrieve
+    hits = retrieve(
+      workspace_id,
+      query,
+      section_keys=_infer_section_keys(section_type),
+    )
+    if not hits:
+      return "", 0
+    return build_rag_context(hits), len(hits)
+  except Exception as e:
+    logger.warning("扩写 RAG 检索失败: %s", e)
+    return "", 0
+
 
 def _parse_json_response(text: str) -> dict:
   text = text.strip()
@@ -92,6 +131,7 @@ async def expand_writing_structured(
   topic: str = "",
   global_requirements: str = "",
   items: list[dict],
+  workspace_id: str | None = None,
 ) -> dict:
   if is_abstract_section(section_type):
     raise ValueError("摘要章节不支持目录结构扩写")
@@ -99,12 +139,20 @@ async def expand_writing_structured(
   if not enabled_items:
     raise ValueError("请至少启用一个小节进行扩写")
 
+  rag_context, rag_count = _fetch_rag_context(
+    workspace_id,
+    f"{topic}\n{preamble}\n{global_requirements}",
+    section_type,
+  )
+  rag_block = rag_context if rag_context else "（未注入文献证据）"
+
   prompt = STRUCTURED_EXPAND_PROMPT.format(
     section_label=get_section_label(section_type),
     topic=topic or "未指定",
     preamble=preamble.strip() or "（无）",
     global_requirements=global_requirements.strip() or "（无）",
     items_spec=_format_structured_items(enabled_items),
+    rag_context=rag_block,
   )
   try:
     text = await _llm_text(prompt, temperature=0.5)
@@ -113,6 +161,7 @@ async def expand_writing_structured(
       "expanded_text": text,
       "mode": "structured",
       "items": enabled_items,
+      "rag_evidence_count": rag_count,
     }
   except Exception as e:
     logger.error("目录结构扩写失败: %s", e)
@@ -128,6 +177,7 @@ async def expand_writing(
   mode: str = "free",
   global_requirements: str = "",
   items: list[dict] | None = None,
+  workspace_id: str | None = None,
 ) -> dict:
   if mode == "structured":
     return await expand_writing_structured(
@@ -136,16 +186,25 @@ async def expand_writing(
       topic=topic,
       global_requirements=global_requirements,
       items=items or [],
+      workspace_id=workspace_id,
     )
 
   if not input_text.strip():
     raise ValueError("请先输入章节内容再进行扩写")
+
+  rag_context, rag_count = _fetch_rag_context(
+    workspace_id,
+    f"{topic}\n{input_text[:2000]}",
+    section_type,
+  )
+  rag_block = rag_context if rag_context else "（未注入文献证据）"
 
   prompt = EXPAND_PROMPT.format(
     length_label=LENGTH_LABELS.get(length, "中"),
     section_label=get_section_label(section_type),
     topic=topic or "未指定",
     input_text=input_text[:12000],
+    rag_context=rag_block,
   )
   if section_type == "abstract":
     prompt += (
@@ -164,6 +223,7 @@ async def expand_writing(
       "original_text": input_text,
       "expanded_text": text,
       "length": length,
+      "rag_evidence_count": rag_count,
     }
   except Exception as e:
     logger.error("扩写失败: %s", e)
@@ -197,12 +257,20 @@ async def polish_text_structured(
   style: str = "moderate",
   global_requirements: str = "",
   items: list[dict],
+  workspace_id: str | None = None,
 ) -> dict:
   if is_abstract_section(section_type):
     raise ValueError("摘要章节不支持目录结构润色")
   enabled_items = [item for item in items if item.get("enabled", True)]
   if not enabled_items:
     raise ValueError("请至少启用一个小节进行润色")
+
+  rag_context, rag_count = _fetch_rag_context(
+    workspace_id,
+    f"{topic}\n{preamble}",
+    section_type,
+  )
+  rag_block = rag_context if rag_context else "（未注入文献证据）"
 
   prompt = STRUCTURED_POLISH_PROMPT.format(
     style_label=POLISH_LABELS.get(style, "中等润色"),
@@ -211,6 +279,7 @@ async def polish_text_structured(
     preamble=preamble.strip() or "（无）",
     global_requirements=global_requirements.strip() or "（无）",
     items_spec=_format_structured_items(enabled_items),
+    rag_context=rag_block,
   )
   try:
     result = await _llm_json(prompt, temperature=0.4)
@@ -223,6 +292,7 @@ async def polish_text_structured(
       "changes_summary": result.get("changes_summary", []),
       "mode": "structured",
       "style": style,
+      "rag_evidence_count": rag_count,
     }
   except Exception as e:
     logger.error("目录结构润色失败: %s", e)
@@ -238,6 +308,7 @@ async def polish_text(
   mode: str = "free",
   global_requirements: str = "",
   items: list[dict] | None = None,
+  workspace_id: str | None = None,
 ) -> dict:
   if mode == "structured":
     return await polish_text_structured(
@@ -247,15 +318,24 @@ async def polish_text(
       style=style,
       global_requirements=global_requirements,
       items=items or [],
+      workspace_id=workspace_id,
     )
 
   if not text.strip():
     raise ValueError("请先输入章节内容再进行润色")
 
+  rag_context, rag_count = _fetch_rag_context(
+    workspace_id,
+    f"{topic}\n{text[:2000]}",
+    section_type,
+  )
+  rag_block = rag_context if rag_context else "（未注入文献证据）"
+
   prompt = POLISH_PROMPT.format(
     style_label=POLISH_LABELS.get(style, "中等润色"),
     section_label=get_section_label(section_type),
     text=text,
+    rag_context=rag_block,
   )
   try:
     result = await _llm_json(prompt, temperature=0.4)
@@ -265,6 +345,7 @@ async def polish_text(
       "changes_summary": result.get("changes_summary", []),
       "style": style,
       "mode": "free",
+      "rag_evidence_count": rag_count,
     }
   except Exception as e:
     logger.error("润色失败: %s", e)

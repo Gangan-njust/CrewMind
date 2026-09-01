@@ -870,7 +870,7 @@ class ResultStore:
     ]
     return "\n".join(sections)
 
-  def build_docx(self, md_content: str) -> bytes:
+  def build_docx(self, md_content: str, *, first_line_indent: bool = False) -> bytes:
     html = markdown.markdown(
       md_content,
       extensions=["tables", "fenced_code", "nl2br", "sane_lists"],
@@ -880,6 +880,9 @@ class ResultStore:
     HtmlToDocx().add_html_to_document(html, document)
     apply_three_line_tables(document)
     apply_black_fonts(document)
+    if first_line_indent:
+      from backend.utils.docx_tables import apply_paragraph_first_line_indent
+      apply_paragraph_first_line_indent(document)
     buffer = io.BytesIO()
     document.save(buffer)
     return buffer.getvalue()
@@ -959,6 +962,7 @@ class ResultStore:
       "user_input": row.user_input[:100],
       "created_at": row.created_at.isoformat(),
       "task_count": len(tasks),
+      "partial": bool(json.loads(row.metadata_json or "{}").get("partial")),
     }
 
   @staticmethod
@@ -1001,6 +1005,7 @@ class ResultStore:
       "scenario": row.scenario,
       "created_at": row.created_at.isoformat(),
       "task_count": len(tasks),
+      "partial": bool(json.loads(row.metadata_json or "{}").get("partial")),
       "is_best": row.id == best_record_id,
     }
 

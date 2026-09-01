@@ -8,6 +8,8 @@ from backend.agents.registry import (
   is_builtin,
   list_agents,
 )
+from backend.agents import extractor
+from backend.agents.prompt_parser import normalize_pasted_prompt, parse_markdown_agent_prompt
 from backend.auth import get_user_by_username
 from backend.storage.database import setup_database
 from backend.tasks.definitions import TaskDefinition
@@ -93,3 +95,78 @@ class TestTaskFiltering:
       TaskDefinition(id="t1", name="A", description="", agent_id="planner", depends_on=[]),
     ]
     assert filter_tasks_by_agents(tasks, []) == tasks
+
+
+class TestAgentExtractor:
+  @pytest.mark.asyncio
+  async def test_extract_agent_from_freeform_prompt(self, monkeypatch):
+    async def fake_chat(messages, **kwargs):
+      return (
+        '{"name":"数据分析师","title":"统计分析与数据挖掘专家",'
+        '"background":"熟悉 Python 与统计建模，擅长实验数据清洗与可视化。",'
+        '"goal":"根据研究问题设计分析流程并输出可复现结论。",'
+        '"tools":["rag_search","web_search"],"use_reasoning":false}'
+      )
+
+    monkeypatch.setattr(extractor.llm_client, "chat", fake_chat)
+    result = await extractor.extract_agent_from_prompt(
+      "你是一名数据分析师，负责帮课题组做统计分析和文献支撑。"
+    )
+    assert result["name"] == "数据分析师"
+    assert result["tools"] == ["rag_search", "web_search"]
+    assert result["use_reasoning"] is False
+
+  @pytest.mark.asyncio
+  async def test_reject_short_prompt(self):
+    with pytest.raises(ValueError, match="过短"):
+      await extractor.extract_agent_from_prompt("太短")
+
+
+class TestMarkdownPromptParser:
+  def test_unwrap_markdown_fence(self):
+    raw = "```markdown\n# 专家\n\n## 专业背景\n背景内容足够长。\n```"
+    assert normalize_pasted_prompt(raw).startswith("# 专家")
+
+  def test_parse_markdown_sections(self):
+    prompt = """# 文献调研专家
+
+你是一位专业的学术文献调研分析师。
+
+## 专业背景
+- 精通文献检索策略
+- 熟悉 Semantic Scholar 与 PubMed
+
+## 核心目标
+基于课题规划检索并分析相关文献，识别研究空白。
+
+## 可用工具
+rag_search, web_search
+"""
+    data = parse_markdown_agent_prompt(prompt)
+    assert data["name"] == "文献调研专家"
+    assert "文献检索" in data["background"]
+    assert "研究空白" in data["goal"]
+    assert data["tools"] == ["rag_search", "web_search"]
+
+  @pytest.mark.asyncio
+  async def test_extract_merges_markdown_with_llm(self, monkeypatch):
+    markdown_prompt = """# 测试角色
+
+## 专业背景
+这是 Markdown 背景描述，包含足够的信息用于测试。
+
+## 核心目标
+这是 Markdown 目标描述，说明角色的职责与输出要求。
+"""
+
+    async def fake_chat(messages, **kwargs):
+      return (
+        '{"name":"LLM名称","title":"LLM职称",'
+        '"background":"短背景","goal":"短目标","tools":["web_search"],"use_reasoning":false}'
+      )
+
+    monkeypatch.setattr(extractor.llm_client, "chat", fake_chat)
+    result = await extractor.extract_agent_from_prompt(markdown_prompt)
+    assert "Markdown 背景" in result["background"]
+    assert "Markdown 目标" in result["goal"]
+    assert result["tools"] == ["web_search"]

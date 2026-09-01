@@ -1,5 +1,6 @@
 """文献工作空间数据存储"""
 import json
+import logging
 import re
 import shutil
 import uuid
@@ -15,10 +16,13 @@ from backend.utils.text import sanitize_unicode, sanitize_deep
 from backend.storage.database import get_session
 from backend.storage.models import (
   LiteratureAnalysisRecord,
+  LiteratureIndexStatus,
   LiteratureRecord,
   WorkspaceRecord,
   WorkspaceSelectionRecord,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _load_json(text: str, default=None):
@@ -138,6 +142,9 @@ class LiteratureStore:
       session.execute(delete(WorkspaceRecord).where(WorkspaceRecord.id == workspace_id))
       session.commit()
 
+    from backend.rag.indexer import delete_workspace_index
+    delete_workspace_index(workspace_id)
+
     lit_dir = PROJECT_ROOT / settings.literature_dir / workspace_id
     if lit_dir.exists():
       shutil.rmtree(lit_dir, ignore_errors=True)
@@ -167,10 +174,12 @@ class LiteratureStore:
     year = None
 
     try:
-      text_preview = extract_full_text(pdf_path, use_cache=False)[:5000]
-      doi = extract_doi_from_text(text_preview) or ""
-    except Exception:
-      text_preview = ""
+      text_preview = extract_full_text(pdf_path, use_cache=False)
+      doi = extract_doi_from_text(text_preview[:5000]) or ""
+      full_text = sanitize_unicode(text_preview) if text_preview else ""
+    except Exception as e:
+      full_text = ""
+      logger.warning("上传时 PDF 文本提取失败: %s — %s", filename, e)
 
     now = datetime.now()
     lit = LiteratureRecord(
@@ -183,7 +192,7 @@ class LiteratureStore:
       doi=doi,
       abstract=abstract,
       pdf_path=str(pdf_path),
-      full_text=sanitize_unicode(text_preview) if text_preview else "",
+      full_text=full_text,
       uploaded_at=now,
       status="pending",
     )
@@ -191,7 +200,18 @@ class LiteratureStore:
       session.add(lit)
       session.commit()
 
+    if full_text.strip() or abstract.strip():
+      self._schedule_rag_index(lit_id)
     return self.get_literature(workspace_id, lit_id, user_id)
+
+  def _schedule_rag_index(self, literature_id: str) -> None:
+    if not settings.rag_enabled:
+      return
+    try:
+      from backend.rag.indexer import schedule_index_sync
+      schedule_index_sync(literature_id)
+    except Exception:
+      pass
 
   async def enrich_metadata(self, literature_id: str) -> dict:
     with get_session() as session:
@@ -229,6 +249,15 @@ class LiteratureStore:
       if page_size:
         stmt = stmt.offset((page - 1) * page_size).limit(page_size)
       rows = session.scalars(stmt).all()
+      lit_ids = [r.id for r in rows]
+      status_map: dict[str, LiteratureIndexStatus] = {}
+      if lit_ids:
+        for st in session.scalars(
+          select(LiteratureIndexStatus).where(
+            LiteratureIndexStatus.literature_id.in_(lit_ids)
+          )
+        ).all():
+          status_map[st.literature_id] = st
       result = []
       for lit in rows:
         analysis = None
@@ -238,7 +267,7 @@ class LiteratureStore:
               LiteratureAnalysisRecord.literature_id == lit.id
             )
           )
-        result.append(self._serialize(lit, analysis))
+        result.append(self._serialize(lit, analysis, status_map.get(lit.id)))
       return result
 
   def get_literature(self, workspace_id: str, literature_id: str, user_id: str) -> dict:
@@ -252,7 +281,12 @@ class LiteratureStore:
           LiteratureAnalysisRecord.literature_id == literature_id
         )
       )
-      return self._serialize(lit, analysis)
+      index_status = session.scalar(
+        select(LiteratureIndexStatus).where(
+          LiteratureIndexStatus.literature_id == literature_id
+        )
+      )
+      return self._serialize(lit, analysis, index_status)
 
   def get_literatures_by_ids(self, workspace_id: str, literature_ids: list[str]) -> list[dict]:
     with get_session() as session:
@@ -270,7 +304,14 @@ class LiteratureStore:
             LiteratureAnalysisRecord.literature_id == lit.id
           )
         )
-        items.append((id_order.get(lit.id, 999), self._serialize(lit, analysis)))
+        items.append((id_order.get(lit.id, 999), self._serialize(
+          lit, analysis,
+          session.scalar(
+            select(LiteratureIndexStatus).where(
+              LiteratureIndexStatus.literature_id == lit.id
+            )
+          ),
+        )))
       items.sort(key=lambda x: x[0])
       return [item[1] for item in items]
 
@@ -290,8 +331,15 @@ class LiteratureStore:
       session.delete(lit)
       session.commit()
 
+    from backend.rag.indexer import delete_literature_index
+    delete_literature_index(literature_id)
+
     if pdf_path:
       Path(pdf_path).unlink(missing_ok=True)
+
+    lit_dir = PROJECT_ROOT / settings.literature_dir / workspace_id / literature_id
+    if lit_dir.exists():
+      shutil.rmtree(lit_dir, ignore_errors=True)
 
   def update_analysis(self, literature_id: str, user_id: str, updates: dict) -> dict:
     with get_session() as session:
@@ -319,12 +367,14 @@ class LiteratureStore:
         "limitations": "limitations_json",
         "citation_templates": "citation_templates_json",
         "formulas": "formulas_json",
+        "results": "results_json",
+        "images": "images_json",
         "research_background": "research_background",
         "research_goal": "research_goal",
         "methods_summary": "methods_summary",
         "conclusion": "conclusion",
       }
-      json_fields = {"tags", "key_findings", "limitations", "citation_templates", "formulas"}
+      json_fields = {"tags", "key_findings", "limitations", "citation_templates", "formulas", "results", "images"}
       for key, col in field_map.items():
         if key in updates:
           val = updates[key]
@@ -333,9 +383,18 @@ class LiteratureStore:
           setattr(analysis, col, val)
       analysis.updated_at = datetime.now()
       session.commit()
-      return self._serialize(lit, analysis)
+      return self._serialize(lit, analysis, session.scalar(
+        select(LiteratureIndexStatus).where(
+          LiteratureIndexStatus.literature_id == literature_id
+        )
+      ))
 
-  def _serialize(self, lit: LiteratureRecord, analysis: LiteratureAnalysisRecord | None) -> dict:
+  def _serialize(
+    self,
+    lit: LiteratureRecord,
+    analysis: LiteratureAnalysisRecord | None,
+    index_status: LiteratureIndexStatus | None = None,
+  ) -> dict:
     item = {
       "id": lit.id,
       "workspace_id": lit.workspace_id,
@@ -349,6 +408,22 @@ class LiteratureStore:
       "uploaded_at": lit.uploaded_at.isoformat(),
       "status": lit.status,
     }
+    if index_status:
+      item["index_status"] = {
+        "status": index_status.status,
+        "chunk_count": index_status.chunk_count,
+        "error_message": index_status.error_message,
+        "indexed_at": index_status.indexed_at.isoformat() if index_status.indexed_at else None,
+        "updated_at": index_status.updated_at.isoformat(),
+      }
+    else:
+      item["index_status"] = {
+        "status": "pending",
+        "chunk_count": 0,
+        "error_message": "",
+        "indexed_at": None,
+        "updated_at": None,
+      }
     if analysis:
       item["analysis"] = {
         "id": analysis.id,
@@ -360,6 +435,8 @@ class LiteratureStore:
         "limitations": _load_json(analysis.limitations_json, []),
         "citation_templates": _load_json(analysis.citation_templates_json, []),
         "formulas": _load_json(analysis.formulas_json, []),
+        "results": _load_json(analysis.results_json, {}),
+        "images": _load_json(analysis.images_json, []),
         "research_background": analysis.research_background,
         "research_goal": analysis.research_goal,
         "methods_summary": analysis.methods_summary,

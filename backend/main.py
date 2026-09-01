@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, UploadFile, File, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Request, UploadFile, File, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
@@ -17,6 +17,7 @@ from backend.auth import (
   authenticate_user,
   create_access_token,
   create_user,
+  decode_token,
   get_current_user,
   serialize_user,
 )
@@ -27,7 +28,9 @@ from backend.agents.registry import (
   delete_custom_agent,
   update_custom_agent,
 )
+from backend.agents.extractor import extract_agent_from_prompt
 from backend.crew.manager import workflow_manager
+from backend.llm.client import llm_client, set_llm_run_context
 from backend.storage.database import setup_database
 from backend.tasks.definitions import TaskStatus
 from backend.storage.results import result_store
@@ -36,6 +39,35 @@ from backend.storage.uploads import upload_store
 
 logging.basicConfig(level=settings.log_level)
 logger = logging.getLogger(__name__)
+
+
+async def _preload_rag_models() -> None:
+  """后台预下载 RAG 模型，避免首次索引时才联网超时。"""
+  if not settings.rag_enabled:
+    return
+  if (settings.embedding_provider or "fastembed").lower() != "fastembed":
+    return
+  try:
+    from backend.rag.embedder import get_embedder
+    from backend.rag.hf_hub import configure_hf_hub
+
+    configure_hf_hub()
+    await asyncio.to_thread(get_embedder)
+    logger.info("RAG Embedding 模型已就绪: %s", settings.embedding_model)
+    if settings.rag_rerank_enabled:
+      try:
+        from backend.rag.reranker import _get_reranker
+
+        await asyncio.to_thread(_get_reranker)
+        logger.info("RAG Rerank 模型已就绪: %s", settings.rag_rerank_model)
+      except Exception as e:
+        logger.warning("RAG Rerank 模型预加载失败（检索将回退 RRF 排序）: %s", e)
+  except Exception as e:
+    logger.warning(
+      "RAG 模型预加载失败（首次索引时将重试）: %s。"
+      "可在 .env 设置 HF_ENDPOINT=https://hf-mirror.com 或运行 py -3 scripts/preload_rag_models.py",
+      e,
+    )
 
 
 @asynccontextmanager
@@ -48,6 +80,9 @@ async def lifespan(app: FastAPI):
     logger.info("DeepSeek API Key 已加载 (长度: %d)", len(key))
   else:
     logger.warning("DeepSeek API Key 未配置！请在 %s 中设置 DEEPSEEK_API_KEY", ENV_FILE)
+  if settings.rag_enabled:
+    asyncio.create_task(_preload_rag_models())
+  logger.info("Agent 角色提取接口: POST /api/agents/extract")
   yield
 
 
@@ -67,6 +102,30 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def llm_user_context_middleware(request: Request, call_next):
+  """根据登录态为当前请求注入 LLM 上下文：后续所有 LLM 调用优先使用用户自定义 Key。"""
+  auth = request.headers.get("Authorization", "")
+  if auth.startswith("Bearer "):
+    try:
+      payload = decode_token(auth[7:])
+      user_id = payload.get("sub")
+      if user_id:
+        path = request.url.path
+        if path.startswith("/api/writing"):
+          source = "writing"
+        elif path.startswith("/api/experiment"):
+          source = "experiment"
+        elif path.startswith("/api/literature") or path.startswith("/api/rag") or path.startswith("/api/reports"):
+          source = "literature"
+        else:
+          source = "workflow"
+        set_llm_run_context(user_id=user_id, run_id=None, source=source)
+    except HTTPException:
+      pass
+  return await call_next(request)
+
+
 # ── 请求/响应模型 ──────────────────────────────────────────────
 
 class StartWorkflowRequest(BaseModel):
@@ -75,6 +134,7 @@ class StartWorkflowRequest(BaseModel):
   reference_file_ids: list[str] = Field(default_factory=list, description="上传的参考文件 ID 列表")
   selected_agents: list[str] = Field(default_factory=list, description="参与协作的 Agent 角色 ID 列表")
   topic_id: str | None = Field(None, description="关联课题 ID，用于在同一课题下生成新版本")
+  workspace_id: str | None = Field(None, description="关联文献工作空间 ID，启用本地文献库 RAG 检索")
   collaboration_mode: str = Field(
     "sequential",
     description="协作模式：sequential（串行）| debate（辩论）| voting（投票）",
@@ -100,10 +160,18 @@ class AgentUpdateRequest(BaseModel):
   use_reasoning: bool = False
 
 
+class AgentExtractRequest(BaseModel):
+  prompt: str = Field(..., min_length=10, description="任意格式的角色描述或系统提示词")
+
+
 class FeedbackRequest(BaseModel):
   task_id: str
   feedback: str = ""
   approved: bool = True
+
+
+class RetryTaskRequest(BaseModel):
+  task_id: str
 
 
 class CompareRequest(BaseModel):
@@ -176,7 +244,9 @@ def _attach_event_callback(crew) -> None:
 
 
 async def _finalize_crew(crew) -> None:
-  if crew.status == "completed":
+  """工作流结束（完成/失败）时持久化结果；失败时保存已完成子任务的「部分结果」，防止白跑 token"""
+  if crew.status == "completed" and not crew._saved_complete:
+    crew._saved_complete = True
     result_store.save(
       crew_id=crew.id,
       scenario=crew.scenario,
@@ -185,6 +255,26 @@ async def _finalize_crew(crew) -> None:
       results=crew._serialize_results(),
       topic_id=crew.topic_id,
       metadata={"collaboration_mode": crew.collaboration_mode},
+    )
+  elif crew.status == "failed" and not crew._saved_partial:
+    crew._saved_partial = True
+    result_store.save(
+      crew_id=crew.id,
+      scenario=crew.scenario,
+      user_input=crew.user_input,
+      user_id=crew.user_id,
+      results=crew._serialize_results(),
+      topic_id=crew.topic_id,
+      metadata={
+        "collaboration_mode": crew.collaboration_mode,
+        "partial": True,
+        "status": "failed",
+      },
+    )
+    logger.info(
+      "工作流 %s 失败，已保存部分结果（%d 个已完成子任务）",
+      crew.id,
+      sum(1 for r in crew.results.values() if r.status == TaskStatus.COMPLETED),
     )
 
 
@@ -237,8 +327,17 @@ async def get_available_tools(current_user: User = Depends(get_current_user)):
     "web_search": "学术文献检索",
     "file_parser": "参考文件解析",
     "code_interpreter": "样本量与预算计算",
+    "rag_search": "本地文献库检索",
   }
   return [{"id": t, "label": labels.get(t, t)} for t in sorted(VALID_TOOLS)]
+
+
+@app.post("/api/agents/extract")
+async def extract_agent(req: AgentExtractRequest, current_user: User = Depends(get_current_user)):
+  try:
+    return await extract_agent_from_prompt(req.prompt)
+  except ValueError as e:
+    raise HTTPException(400, str(e))
 
 
 @app.post("/api/agents")
@@ -365,9 +464,11 @@ async def start_workflow(req: StartWorkflowRequest, current_user: User = Depends
     selected_agents=req.selected_agents or None,
     topic_id=req.topic_id,
     collaboration_mode=req.collaboration_mode,
+    workspace_id=req.workspace_id,
   )
 
   _attach_event_callback(crew)
+  set_llm_run_context(user_id=current_user.id, run_id=crew.id, source="workflow")
 
   async def run_crew():
     try:
@@ -425,6 +526,7 @@ async def submit_feedback(
     raise HTTPException(400, "该任务不在待审核状态")
 
   _attach_event_callback(crew)
+  set_llm_run_context(user_id=current_user.id, run_id=crew_id, source="workflow")
 
   async def run_feedback():
     try:
@@ -455,6 +557,7 @@ async def resume_workflow(crew_id: str, current_user: User = Depends(get_current
     raise HTTPException(400, "工作流未处于中止状态，无法继续")
 
   _attach_event_callback(crew)
+  set_llm_run_context(user_id=current_user.id, run_id=crew_id, source="workflow")
 
   async def run_resume():
     try:
@@ -466,6 +569,36 @@ async def resume_workflow(crew_id: str, current_user: User = Depends(get_current
 
   asyncio.create_task(run_resume())
   return {"status": "resuming", "crew_id": crew_id}
+
+
+@app.post("/api/workflow/{crew_id}/retry")
+async def retry_workflow_task(
+  crew_id: str, req: RetryTaskRequest, current_user: User = Depends(get_current_user)
+):
+  """重试失败的工作流子任务：仅重跑失败任务及其下游，已完成子任务结果保留"""
+  crew = workflow_manager.get_crew(crew_id, current_user.id)
+  if not crew:
+    raise HTTPException(404, "工作流不存在")
+  if crew.status != "failed":
+    raise HTTPException(400, "仅失败的工作流可以重试任务")
+
+  result = crew.results.get(req.task_id)
+  if not result or result.status != TaskStatus.FAILED:
+    raise HTTPException(400, "该任务未处于失败状态，无法重试")
+
+  _attach_event_callback(crew)
+  set_llm_run_context(user_id=current_user.id, run_id=crew_id, source="workflow")
+
+  async def run_retry():
+    try:
+      await crew.retry_task(req.task_id)
+      await _finalize_crew(crew)
+    except Exception as e:
+      logger.exception("Crew retry failed")
+      await ws_manager.broadcast(crew_id, {"type": "crew_failed", "error": str(e)})
+
+  asyncio.create_task(run_retry())
+  return {"status": "retrying", "crew_id": crew_id}
 
 
 @app.get("/api/results")
@@ -711,6 +844,10 @@ from backend.routes.experiment import router as experiment_router
 
 app.include_router(experiment_router)
 
+from backend.routes.toolbox import router as toolbox_router
+
+app.include_router(toolbox_router)
+
 
 # ── WebSocket 实时事件 ─────────────────────────────────────────
 
@@ -736,6 +873,7 @@ async def websocket_endpoint(crew_id: str, websocket: WebSocket, token: str = Qu
     await websocket.close(code=4004, reason="工作流不存在")
     return
 
+  set_llm_run_context(user_id=user.id, run_id=crew_id, source="workflow")
   await ws_manager.connect(crew_id, websocket)
   try:
     await websocket.send_json({

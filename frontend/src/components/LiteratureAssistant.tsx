@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   BookOpen, Plus, Trash2, Upload, Search, CheckSquare, Square,
-  Loader, X, Copy, FileText, Sparkles, ChevronRight, Bookmark, Check,
+  Loader, X, Copy, FileText, Sparkles, ChevronRight, Bookmark, Check, PenLine,
+  MessageCircle, RefreshCw,
 } from 'lucide-react'
 import {
   fetchWorkspaces, createWorkspace, updateWorkspace, deleteWorkspace,
@@ -10,8 +11,9 @@ import {
   fetchSelectedLiteratures, saveSelectionTemplate,
   connectLiteratureWebSocket, startProposalFromLiterature,
   updateLiteratureAnalysis, fetchAgents, fetchScenarios,
+  reindexLiterature, ragQuery, literatureImageUrl,
   type Workspace, type Literature, type AnalysisProgress, type DataSourceMode,
-  type Agent, type Scenario,
+  type Agent, type Scenario, type RagSource, type LiteratureImage,
 } from '../api'
 import { FormulaBlock } from './FormulaBlock'
 
@@ -20,6 +22,13 @@ const STATUS_LABELS: Record<string, string> = {
   processing: '分析中',
   done: '已完成',
   failed: '失败',
+}
+
+const INDEX_STATUS_LABELS: Record<string, string> = {
+  pending: '待索引',
+  indexing: '索引中',
+  done: '已索引',
+  failed: '索引失败',
 }
 
 const PROPOSAL_SCENARIO_ID = 'literature_based_proposal'
@@ -34,9 +43,10 @@ function defaultProposalAgents(scenario: Scenario | null, agents: Agent[]): stri
 
 interface Props {
   onStartWorkflow: (crewId: string) => void
+  onStartWriting?: (workspace: Workspace) => void
 }
 
-export function LiteratureAssistant({ onStartWorkflow }: Props) {
+export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([])
   const [activeWorkspace, setActiveWorkspace] = useState<Workspace | null>(null)
   const [literatures, setLiteratures] = useState<Literature[]>([])
@@ -63,7 +73,13 @@ export function LiteratureAssistant({ onStartWorkflow }: Props) {
   const [dragOver, setDragOver] = useState(false)
   const [toast, setToast] = useState('')
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null)
+  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null)
   const [debouncedKeyword, setDebouncedKeyword] = useState('')
+  const [ragQuestion, setRagQuestion] = useState('')
+  const [ragAnswer, setRagAnswer] = useState('')
+  const [ragSources, setRagSources] = useState<RagSource[]>([])
+  const [ragLoading, setRagLoading] = useState(false)
+  const [reindexingId, setReindexingId] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const toastTimer = useRef<ReturnType<typeof setTimeout>>()
@@ -141,14 +157,15 @@ export function LiteratureAssistant({ onStartWorkflow }: Props) {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        if (detailLit) setDetailLit(null)
+        if (lightboxSrc) setLightboxSrc(null)
+        else if (detailLit) setDetailLit(null)
         else if (showProposal) setShowProposal(false)
         else if (showCreateWs) setShowCreateWs(false)
       }
     }
     document.addEventListener('keydown', handleKeyDown)
     return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [detailLit, showProposal, showCreateWs])
+  }, [lightboxSrc, detailLit, showProposal, showCreateWs])
 
   const handleCreateWorkspace = async () => {
     if (!wsForm.name.trim()) return
@@ -273,9 +290,58 @@ export function LiteratureAssistant({ onStartWorkflow }: Props) {
 
   const statusClass = (status: string) => {
     if (status === 'done') return 'status-done'
-    if (status === 'processing') return 'status-running'
+    if (status === 'processing' || status === 'indexing') return 'status-running'
     if (status === 'failed') return 'status-failed'
     return 'status-pending'
+  }
+
+  const indexStatusClass = (status: string) => {
+    if (status === 'done') return 'status-done'
+    if (status === 'indexing') return 'status-running'
+    if (status === 'failed') return 'status-failed'
+    return 'status-pending'
+  }
+
+  const handleReindex = async (lit: Literature) => {
+    if (!activeWorkspace) return
+    setReindexingId(lit.id)
+    setError('')
+    try {
+      await reindexLiterature(activeWorkspace.id, lit.id, true)
+      showToast('已开始重新索引')
+      setTimeout(() => loadLiteratures(activeWorkspace.id, debouncedKeyword || undefined), 2000)
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setReindexingId(null)
+    }
+  }
+
+  const handleRagQuery = async () => {
+    if (!activeWorkspace || !ragQuestion.trim()) return
+    setRagLoading(true)
+    setRagAnswer('')
+    setRagSources([])
+    setError('')
+    try {
+      const scopeIds = selectedIds.length ? selectedIds : undefined
+      await ragQuery(activeWorkspace.id, {
+        question: ragQuestion.trim(),
+        literature_ids: scopeIds,
+        stream: true,
+        onToken: (token) => setRagAnswer(prev => prev + token),
+        onSources: (sources) => setRagSources(sources),
+      })
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setRagLoading(false)
+    }
+  }
+
+  const openSourceLiterature = (source: RagSource) => {
+    const lit = literatures.find(l => l.id === source.literature_id)
+    if (lit) setDetailLit(lit)
   }
 
   const openProposalModal = async () => {
@@ -297,6 +363,37 @@ export function LiteratureAssistant({ onStartWorkflow }: Props) {
       setProposalSelectedAgents([])
     }
     setShowProposal(true)
+  }
+
+  const renderInlineImages = (lit: Literature, sections: string[]) => {
+    const imgs = (lit.analysis?.images || []).filter(
+      img => sections.includes(img.section || ''),
+    )
+    if (!imgs.length) return null
+    return (
+      <div className="literature-inline-images">
+        {imgs.map((img: LiteratureImage, i: number) => (
+          <figure key={i} className="literature-inline-image">
+            <button
+              type="button"
+              className="literature-inline-image-open"
+              title="点击查看大图"
+              onClick={() => setLightboxSrc(literatureImageUrl(activeWorkspace?.id || '', lit.id, img.filename))}
+            >
+              <img
+                src={literatureImageUrl(activeWorkspace?.id || '', lit.id, img.filename)}
+                alt={img.caption || `文献第 ${img.page} 页图片`}
+                loading="lazy"
+              />
+            </button>
+            <figcaption>
+              {img.caption || `第 ${img.page} 页`}
+              {img.page ? <span className="literature-inline-page"> · 第 {img.page} 页</span> : null}
+            </figcaption>
+          </figure>
+        ))}
+      </div>
+    )
   }
 
   const renderAnalysisDetail = (lit: Literature) => (
@@ -326,12 +423,64 @@ export function LiteratureAssistant({ onStartWorkflow }: Props) {
             <h4>研究背景与目标</h4>
             <p>{lit.analysis.research_background}</p>
             <p>{lit.analysis.research_goal}</p>
+            {renderInlineImages(lit, ['background'])}
           </div>
           <div className="analysis-card">
             <h4>方法与主要发现</h4>
             <p>{lit.analysis.methods_summary}</p>
             <ul>{lit.analysis.key_findings.map((f, i) => <li key={i}>{f}</li>)}</ul>
+            {renderInlineImages(lit, ['methods'])}
           </div>
+          <div className="analysis-card">
+            <h4>文章总结与结果</h4>
+            {lit.analysis.results?.article_summary ? (
+              <p className="result-article-summary">{lit.analysis.results.article_summary}</p>
+            ) : null}
+            {lit.analysis.results?.results_summary ? (
+              <p className="text-muted">{lit.analysis.results.results_summary}</p>
+            ) : null}
+            {lit.analysis.results?.result_items && lit.analysis.results.result_items.length > 0 ? (
+              <ul className="result-items">
+                {lit.analysis.results.result_items.map((item, i) => <li key={i}>{item}</li>)}
+              </ul>
+            ) : null}
+            {lit.analysis.results?.important_figures && lit.analysis.results.important_figures.length > 0 && (
+              <div className="important-figures">
+                <h5>重要图表</h5>
+                <ul>
+                  {lit.analysis.results.important_figures.map((fig, i) => <li key={i}>{fig}</li>)}
+                </ul>
+              </div>
+            )}
+            {renderInlineImages(lit, ['results', 'discussion', 'conclusion'])}
+            {!lit.analysis.results?.article_summary && !lit.analysis.results?.results_summary && (
+              <p className="text-muted">暂无可用的结果摘要，请重新执行「分析」以获取。</p>
+            )}
+          </div>
+          {lit.analysis.images && lit.analysis.images.some(img => !img.section) && (
+            <div className="analysis-card">
+              <h4>其他图片</h4>
+              <div className="literature-image-grid">
+                {lit.analysis.images.filter(img => !img.section).map((img: LiteratureImage, i: number) => (
+                  <figure key={i} className="literature-image-item">
+                    <button
+                      type="button"
+                      className="literature-image-open"
+                      title="点击查看大图"
+                      onClick={() => setLightboxSrc(literatureImageUrl(activeWorkspace?.id || '', lit.id, img.filename))}
+                    >
+                      <img
+                        src={literatureImageUrl(activeWorkspace?.id || '', lit.id, img.filename)}
+                        alt={`文献第 ${img.page} 页图片`}
+                        loading="lazy"
+                      />
+                    </button>
+                    <figcaption>第 {img.page} 页{img.width && img.height ? ` · ${img.width}×${img.height}` : ''}</figcaption>
+                  </figure>
+                ))}
+              </div>
+            </div>
+          )}
           <div className="analysis-card">
             <h4>关键公式</h4>
             {lit.analysis.formulas && lit.analysis.formulas.length > 0 ? (
@@ -371,7 +520,8 @@ export function LiteratureAssistant({ onStartWorkflow }: Props) {
         <div className="empty-state">
           <p>尚未分析</p>
           <button className="btn btn-primary btn-sm"
-            onClick={() => handleAnalyze([lit.id])}>开始分析</button>
+            title="点击后先自动完成 RAG 索引，再基于切块结果进行分析"
+            onClick={() => handleAnalyze([lit.id])}>开始分析（自动索引）</button>
         </div>
       )}
     </>
@@ -526,6 +676,58 @@ export function LiteratureAssistant({ onStartWorkflow }: Props) {
             </button>
           </div>
 
+          {/* 基于文献库提问 */}
+          <div className="literature-rag-query card">
+            <div className="literature-rag-query-header">
+              <MessageCircle size={18} />
+              <h3>基于文献库提问</h3>
+              {selectedIds.length > 0 && (
+                <span className="literature-rag-scope">限定 {selectedIds.length} 篇选定文献</span>
+              )}
+            </div>
+            <textarea
+              className="form-input literature-rag-input"
+              rows={3}
+              placeholder="例如：这些文献的主要研究方法有哪些异同？"
+              value={ragQuestion}
+              onChange={e => setRagQuestion(e.target.value)}
+            />
+            <div className="literature-rag-actions">
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                disabled={ragLoading || !ragQuestion.trim()}
+                onClick={handleRagQuery}
+              >
+                {ragLoading ? <><Loader size={14} className="spinner" /> 回答中…</> : '提问'}
+              </button>
+            </div>
+            {(ragAnswer || ragSources.length > 0) && (
+              <div className="literature-rag-result fade-in">
+                {ragAnswer && (
+                  <div className="literature-rag-answer">{ragAnswer}</div>
+                )}
+                {ragSources.length > 0 && (
+                  <div className="literature-rag-sources">
+                    <strong>参考来源</strong>
+                    {ragSources.map((src, i) => (
+                      <button
+                        key={`${src.chunk_id}-${i}`}
+                        type="button"
+                        className="literature-rag-source-item"
+                        onClick={() => openSourceLiterature(src)}
+                      >
+                        <span className="source-title">{src.literature_title || src.literature_id}</span>
+                        <span className="source-meta">{src.section_key || 'unknown'}</span>
+                        <span className="source-excerpt">{src.excerpt}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
           {/* 批量操作 + 选定 / 开题报告 */}
           <div className="batch-bar card">
             <div className="batch-bar-group">
@@ -537,8 +739,12 @@ export function LiteratureAssistant({ onStartWorkflow }: Props) {
                   ? <CheckSquare size={14} /> : <Square size={14} />}
                 全选
               </button>
-              <button className="btn btn-sm btn-primary" onClick={() => handleAnalyze()}>
-                <Sparkles size={14} /> 批量分析 {checkedIds.size ? `(${checkedIds.size})` : '(全部待分析)'}
+              <button
+                className="btn btn-sm btn-primary"
+                onClick={() => handleAnalyze()}
+                title="点击后先自动完成 RAG 索引，再基于切块结果进行分析"
+              >
+                <Sparkles size={14} /> 批量分析（自动索引） {checkedIds.size ? `(${checkedIds.size})` : '(全部待分析)'}
               </button>
             </div>
             <div className="batch-bar-divider" />
@@ -555,6 +761,15 @@ export function LiteratureAssistant({ onStartWorkflow }: Props) {
               <button className="btn btn-sm btn-primary" disabled={!selectedIds.length} onClick={openProposalModal}>
                 <Sparkles size={14} /> 生成开题报告
               </button>
+              {onStartWriting && activeWorkspace && (
+                <button
+                  className="btn btn-sm btn-outline"
+                  onClick={() => onStartWriting(activeWorkspace)}
+                  title="关联当前工作空间并创建写作项目"
+                >
+                  <PenLine size={14} /> 创建写作项目
+                </button>
+              )}
             </div>
           </div>
 
@@ -584,7 +799,8 @@ export function LiteratureAssistant({ onStartWorkflow }: Props) {
                     <th>作者</th>
                     <th>期刊</th>
                     <th>年份</th>
-                    <th>状态</th>
+                    <th>分析</th>
+                    <th>索引</th>
                     <th>匹配度</th>
                     <th>操作</th>
                   </tr>
@@ -604,10 +820,26 @@ export function LiteratureAssistant({ onStartWorkflow }: Props) {
                       <td>{lit.journal || '—'}</td>
                       <td>{lit.year || '—'}</td>
                       <td><span className={`status-tag ${statusClass(lit.status)}`}>{STATUS_LABELS[lit.status]}</span></td>
+                      <td>
+                        <span
+                          className={`status-tag ${indexStatusClass(lit.index_status?.status || 'pending')}`}
+                          title={lit.index_status?.error_message || ''}
+                        >
+                          {INDEX_STATUS_LABELS[lit.index_status?.status || 'pending']}
+                        </span>
+                      </td>
                       <td>{lit.analysis?.relevance_score?.toFixed(1) ?? '—'}</td>
                       <td className="action-cell">
                         <button className="btn btn-sm btn-outline" title="选定" onClick={() => toggleSelect(lit.id)}>
                           {selectedIds.includes(lit.id) ? <CheckSquare size={14} /> : <Square size={14} />}
+                        </button>
+                        <button
+                          className="btn btn-sm btn-outline"
+                          title="重新索引"
+                          disabled={reindexingId === lit.id}
+                          onClick={() => handleReindex(lit)}
+                        >
+                          {reindexingId === lit.id ? <Loader size={14} className="spinner" /> : <RefreshCw size={14} />}
                         </button>
                         <button
                           className="btn btn-sm btn-outline"
@@ -628,7 +860,7 @@ export function LiteratureAssistant({ onStartWorkflow }: Props) {
                     </tr>
                   ))}
                   {literatures.length === 0 && (
-                    <tr><td colSpan={8} className="empty-cell">暂无文献，请上传 PDF</td></tr>
+                    <tr><td colSpan={9} className="empty-cell">暂无文献，请上传 PDF</td></tr>
                   )}
                 </tbody>
               </table>
@@ -734,6 +966,16 @@ export function LiteratureAssistant({ onStartWorkflow }: Props) {
               <button className="btn btn-outline" onClick={() => setShowProposal(false)}>取消</button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* 文献图片灯箱 */}
+      {lightboxSrc && (
+        <div className="modal-overlay exp-lightbox" onClick={() => setLightboxSrc(null)}>
+          <button type="button" className="exp-lightbox-close" onClick={() => setLightboxSrc(null)}>
+            <X size={24} />
+          </button>
+          <img src={lightboxSrc} alt="文献图片" onClick={e => e.stopPropagation()} />
         </div>
       )}
     </div>

@@ -4,7 +4,8 @@ import {
   CheckCircle, Clock, AlertTriangle, XCircle, Loader,
   Sun, Moon, Pause, FileText, FileDown, FileCode, Upload, X,
   Plus, Pencil, Trash2, Settings, LogOut, User, Search,
-  GitCompare, Star, LayoutTemplate, Bookmark, CircleHelp, BookOpen, PenLine, FlaskConical,
+  GitCompare, Star, LayoutTemplate, Bookmark, CircleHelp, BookOpen, PenLine, FlaskConical, ClipboardPaste, Wrench,
+  RefreshCw,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -12,11 +13,12 @@ import { WorkflowVisualization } from './components/WorkflowVisualization'
 import { LiteratureAssistant } from './components/LiteratureAssistant'
 import { WritingAssistant } from './components/WritingAssistant'
 import { ExperimentManager } from './components/ExperimentManager'
+import { ToolboxPage } from './components/Toolbox'
 import {
   fetchScenarios, fetchAgents, startWorkflow, getWorkflowStatus,
-  submitFeedback, suspendWorkflow, resumeWorkflow,
+  submitFeedback, suspendWorkflow, resumeWorkflow, retryTask,
   fetchResult, connectWebSocket, downloadExport,
-  uploadReferenceFile, createAgent, updateAgent, deleteAgent, fetchAvailableTools,
+  uploadReferenceFile, createAgent, updateAgent, deleteAgent, fetchAvailableTools, extractAgentFromPrompt,
   login, register, logout, fetchMe, isAuthenticated,
   fetchTopics, fetchTopicVersions, setBestVersion, compareResults,
   fetchTemplates, createTemplate, deleteTemplate, fetchCollaborationModes,
@@ -35,7 +37,7 @@ import {
 } from './templateUtils'
 import { HELP_SECTIONS } from './helpContent'
 
-type Page = 'dashboard' | 'workflow' | 'agents' | 'history' | 'literature' | 'writing' | 'experiment' | 'help'
+type Page = 'dashboard' | 'workflow' | 'agents' | 'history' | 'literature' | 'writing' | 'experiment' | 'toolbox' | 'help'
 type Theme = 'dark' | 'light'
 
 const THEME_KEY = 'crewmind-theme'
@@ -250,6 +252,7 @@ export default function App() {
   const [templateVariableValues, setTemplateVariableValues] = useState<Record<string, string>>({})
   const [showSaveTemplate, setShowSaveTemplate] = useState(false)
   const [writingFromRecordId, setWritingFromRecordId] = useState<string | null>(null)
+  const [writingFromWorkspace, setWritingFromWorkspace] = useState<{ id: string; name: string } | null>(null)
   const [experimentFromRecordId, setExperimentFromRecordId] = useState<string | null>(null)
 
   const loadAppData = () => {
@@ -514,6 +517,29 @@ export default function App() {
     }
   }
 
+  const handleRetryTask = async (taskId: string) => {
+    if (!crewId) return
+    setIsRunning(true)
+    setToolEvents([])
+    setReviewTaskId('')
+    try {
+      await retryTask(crewId, taskId)
+      setWorkflowStatus(prev => prev ? { ...prev, status: 'running' } : prev)
+      const wsSetters: WorkflowWsSetters = {
+        setWorkflowStatus,
+        setReviewTaskId,
+        setIsRunning,
+        setToolEvents,
+      }
+      // WebSocket 保持连接，重新拉起状态轮询跟踪重试进度
+      startWorkflowStatusPoll(crewId, wsSetters)
+    } catch (e: any) {
+      alert(e.message)
+      setWorkflowStatus(prev => prev ? { ...prev, status: 'failed' } : prev)
+      setIsRunning(false)
+    }
+  }
+
   const currentScenario = activeWorkflowScenario || scenarios.find(s => s.id === selectedScenario)
 
   const handleLiteratureWorkflowStart = async (newCrewId: string) => {
@@ -599,6 +625,10 @@ export default function App() {
         <button className={`nav-item ${page === 'experiment' ? 'active' : ''}`}
           onClick={() => setPage('experiment')}>
           <FlaskConical size={18} /> 实验数据
+        </button>
+        <button className={`nav-item ${page === 'toolbox' ? 'active' : ''}`}
+          onClick={() => setPage('toolbox')}>
+          <Wrench size={18} /> 工具箱
         </button>
         <button className={`nav-item ${page === 'help' ? 'active' : ''}`}
           onClick={() => setPage('help')}>
@@ -690,6 +720,7 @@ export default function App() {
             onReview={handleReview}
             onSuspend={handleSuspend}
             onResume={handleResume}
+            onRetryTask={handleRetryTask}
             toolEvents={toolEvents}
             crewId={crewId}
             collaborationMode={activeCollaborationMode}
@@ -735,13 +766,21 @@ export default function App() {
         {page === 'help' && <HelpPage />}
 
         {page === 'literature' && (
-          <LiteratureAssistant onStartWorkflow={handleLiteratureWorkflowStart} />
+          <LiteratureAssistant
+            onStartWorkflow={handleLiteratureWorkflowStart}
+            onStartWriting={(ws) => {
+              setWritingFromWorkspace({ id: ws.id, name: ws.name })
+              setPage('writing')
+            }}
+          />
         )}
 
         {page === 'writing' && (
           <WritingAssistant
             workflowRecordId={writingFromRecordId}
+            workspaceLink={writingFromWorkspace}
             onProjectReady={() => setWritingFromRecordId(null)}
+            onWorkspaceLinkReady={() => setWritingFromWorkspace(null)}
           />
         )}
 
@@ -750,6 +789,8 @@ export default function App() {
             workflowRecordId={experimentFromRecordId}
           />
         )}
+
+        {page === 'toolbox' && <ToolboxPage />}
         </div>
       </main>
     </div>
@@ -1378,7 +1419,7 @@ function ExportButtons({ crewId, recordId }: { crewId?: string; recordId?: strin
 
 function WorkflowPage({
   scenario, workflowStatus, isRunning, reviewTaskId, reviewFeedback,
-  onReviewFeedbackChange, onReview, onSuspend, onResume, crewId, toolEvents,
+  onReviewFeedbackChange, onReview, onSuspend, onResume, onRetryTask, crewId, toolEvents,
   collaborationMode,
 }: any) {
   if (!workflowStatus) {
@@ -1398,6 +1439,12 @@ function WorkflowPage({
   const canSuspend = workflowStatus.status === 'running' && isRunning
   const canResume = workflowStatus.status === 'suspended'
   const canExport = workflowStatus.status === 'completed' || workflowStatus.status === 'failed'
+  const taskList = (workflowStatus.tasks && workflowStatus.tasks.length)
+    ? workflowStatus.tasks
+    : (scenario?.tasks || [])
+  const failedTasks = taskList.filter(
+    (t: { id: string }) => workflowStatus.results?.[t.id]?.status === 'failed',
+  )
 
   const modeLabel: Record<string, string> = {
     sequential: '串行模式',
@@ -1415,6 +1462,7 @@ function WorkflowPage({
         </span>
         {isRunning && ' · 智能体正在协作中...'}
         {canResume && ' · 工作流已中止，可点击继续恢复执行'}
+        {workflowStatus.status === 'failed' && ' · 部分结果已保存，可直接导出或重试失败任务'}
       </p>
 
       {(canSuspend || canResume || canExport) && (
@@ -1432,6 +1480,31 @@ function WorkflowPage({
           {canExport && crewId && (
             <ExportButtons crewId={crewId} />
           )}
+        </div>
+      )}
+
+      {workflowStatus.status === 'failed' && failedTasks.length > 0 && (
+        <div className="retry-panel">
+          <div className="retry-panel-title">
+            <RefreshCw size={14} /> 失败任务重试
+          </div>
+          <p className="retry-panel-desc">
+            已完成子任务的结果已自动保存到历史方案，可随时导出，已消耗的 token 不会白费。
+            重试只会重跑失败任务及其下游任务，其余已完成任务保持不动：
+          </p>
+          <div className="retry-task-list">
+            {failedTasks.map((t: { id: string; name: string }) => (
+              <button
+                key={t.id}
+                className="btn btn-warning"
+                disabled={isRunning}
+                onClick={() => onRetryTask?.(t.id)}
+                title={`从「${t.name}」继续执行`}
+              >
+                <RefreshCw size={14} /> 重试「{t.name}」
+              </button>
+            ))}
+          </div>
         </div>
       )}
 
@@ -1524,9 +1597,12 @@ function AgentCard({
 function AgentsPage({ agents, onAgentsChange }: { agents: Agent[]; onAgentsChange: () => void }) {
   const [showForm, setShowForm] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [formMode, setFormMode] = useState<'manual' | 'paste'>('manual')
+  const [promptText, setPromptText] = useState('')
   const [form, setForm] = useState<AgentFormData>(EMPTY_AGENT_FORM)
   const [tools, setTools] = useState<ToolOption[]>([])
   const [saving, setSaving] = useState(false)
+  const [extracting, setExtracting] = useState(false)
 
   useEffect(() => {
     fetchAvailableTools().then(setTools)
@@ -1534,12 +1610,16 @@ function AgentsPage({ agents, onAgentsChange }: { agents: Agent[]; onAgentsChang
 
   const openCreate = () => {
     setEditingId(null)
+    setFormMode('manual')
+    setPromptText('')
     setForm(EMPTY_AGENT_FORM)
     setShowForm(true)
   }
 
   const openEdit = (agent: Agent) => {
     setEditingId(agent.id)
+    setFormMode('manual')
+    setPromptText('')
     setForm({
       id: agent.id,
       name: agent.name,
@@ -1555,7 +1635,32 @@ function AgentsPage({ agents, onAgentsChange }: { agents: Agent[]; onAgentsChang
   const closeForm = () => {
     setShowForm(false)
     setEditingId(null)
+    setFormMode('manual')
+    setPromptText('')
     setForm(EMPTY_AGENT_FORM)
+  }
+
+  const handleExtractPrompt = async () => {
+    if (!promptText.trim()) return
+    setExtracting(true)
+    try {
+      const data = await extractAgentFromPrompt(promptText)
+      setForm(prev => ({
+        ...prev,
+        id: data.id ?? prev.id,
+        name: data.name ?? prev.name,
+        title: data.title ?? prev.title,
+        background: data.background ?? prev.background,
+        goal: data.goal ?? prev.goal,
+        tools: data.tools?.length ? data.tools : prev.tools,
+        use_reasoning: data.use_reasoning ?? prev.use_reasoning,
+      }))
+      setFormMode('manual')
+    } catch (e: any) {
+      alert(e.message)
+    } finally {
+      setExtracting(false)
+    }
   }
 
   const handleSave = async () => {
@@ -1615,6 +1720,60 @@ function AgentsPage({ agents, onAgentsChange }: { agents: Agent[]; onAgentsChang
       {showForm && (
         <div className="card agent-form-card">
           <div className="card-title">{editingId ? '编辑角色' : '添加自定义角色'}</div>
+
+          {!editingId && (
+            <>
+              <div className="agent-form-tabs">
+                <button
+                  type="button"
+                  className={`agent-form-tab ${formMode === 'manual' ? 'active' : ''}`}
+                  onClick={() => setFormMode('manual')}
+                >
+                  表单填写
+                </button>
+                <button
+                  type="button"
+                  className={`agent-form-tab ${formMode === 'paste' ? 'active' : ''}`}
+                  onClick={() => setFormMode('paste')}
+                >
+                  <ClipboardPaste size={14} /> 粘贴提示词
+                </button>
+              </div>
+
+              {formMode === 'paste' && (
+                <div className="agent-prompt-panel">
+                  <p className="form-hint">
+                    支持直接粘贴 Markdown 格式提示词（标题、小节、列表、粗体等），也支持普通文本或 JSON。
+                    若整段包在 <code>```markdown</code> 代码块中亦可识别。提取完成后可在「表单填写」中核对修改。
+                  </p>
+                  <div className="form-group">
+                    <label className="form-label">粘贴 Markdown 提示词</label>
+                    <textarea
+                      className="form-textarea agent-prompt-textarea"
+                      value={promptText}
+                      onChange={e => setPromptText(e.target.value)}
+                      placeholder={'支持 Markdown，例如：\n\n# 文献调研专家\n\n你是一位专业的学术文献调研分析师。\n\n## 专业背景\n- 精通文献检索策略\n- 熟悉 RAG 与网络检索\n\n## 核心目标\n输出文献综述并识别研究空白。'}
+                      rows={12}
+                    />
+                  </div>
+                  <div className="form-actions">
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      onClick={handleExtractPrompt}
+                      disabled={!promptText.trim() || extracting}
+                    >
+                      {extracting ? <Loader size={16} className="spinner" /> : <ClipboardPaste size={16} />}
+                      {extracting ? '正在提取…' : '智能提取'}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+
+          {(editingId || formMode === 'manual') && (
+            <>
           <div className="two-col">
             <div className="form-group">
               <label className="form-label">角色名称</label>
@@ -1696,6 +1855,8 @@ function AgentsPage({ agents, onAgentsChange }: { agents: Agent[]; onAgentsChang
             </button>
             <button className="btn btn-outline" onClick={closeForm}>取消</button>
           </div>
+            </>
+          )}
         </div>
       )}
 
@@ -2014,6 +2175,9 @@ function HistoryPage({
           {selectedRecord.version_number && (
             <span className="version-badge">v{selectedRecord.version_number}</span>
           )}
+          {selectedRecord.metadata?.partial && (
+            <span className="partial-badge"><AlertTriangle size={12} /> 部分结果</span>
+          )}
           <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
             <button
               className="btn btn-primary"
@@ -2135,6 +2299,9 @@ function HistoryPage({
                     <span>{ver.title}</span>
                     {ver.is_best && (
                       <span className="best-badge"><Star size={12} /> 当前最佳</span>
+                    )}
+                    {ver.partial && (
+                      <span className="partial-badge"><AlertTriangle size={12} /> 部分结果</span>
                     )}
                   </div>
                   <div className="history-meta">

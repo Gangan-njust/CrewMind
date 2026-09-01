@@ -9,7 +9,7 @@ from backend.agents.roles import AgentRole, ALL_AGENTS as BUILTIN_AGENTS
 from backend.storage.database import get_session
 from backend.storage.models import CustomAgentRecord
 
-VALID_TOOLS = {"web_search", "file_parser", "code_interpreter"}
+VALID_TOOLS = {"web_search", "file_parser", "code_interpreter", "rag_search"}
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 
 

@@ -4,7 +4,8 @@ from datetime import datetime
 
 from backend.storage.results import result_store
 from backend.writing.citations import format_all_references
-from backend.writing.templates import DEFAULT_SECTIONS, PAPER_TEMPLATES, SECTION_LABELS, is_abstract_section, section_display_title
+from backend.writing.section_numbering import compute_section_numbers, numbered_section_title
+from backend.writing.templates import DEFAULT_SECTIONS, PAPER_TEMPLATES, is_abstract_section
 
 
 def _strip_markdown_headings(content: str) -> str:
@@ -62,16 +63,16 @@ def build_markdown(project: dict, bibliography: list[dict] | None = None) -> str
   ])
 
   sections = sorted(project.get("sections", []), key=lambda s: _section_sort_key(project, s))
+  section_numbers = compute_section_numbers(sections)
+
   has_content = False
   for sec in sections:
     content = _section_content_for_export(sec)
     if not content:
       continue
     has_content = True
-    label = section_display_title(sec)
+    label = numbered_section_title(sec, section_numbers)
     lines.extend([
-      "---",
-      "",
       f"## {label}",
       "",
       content,
@@ -80,28 +81,29 @@ def build_markdown(project: dict, bibliography: list[dict] | None = None) -> str
 
   if not has_content:
     lines.extend([
-      "---",
-      "",
       "*暂无章节内容*",
       "",
     ])
 
   if bibliography:
-    lines.extend([
-      "---",
-      "",
-      "## 参考文献",
-      "",
-    ])
-    for ref in bibliography:
-      lines.append(f"{ref.get('formatted', '')}")
-    lines.append("")
+    has_bib_section = any(
+      (sec.get("title") or "").strip() == "参考文献"
+      for sec in project.get("sections", [])
+    )
+    if not has_bib_section:
+      lines.extend([
+        "## 参考文献",
+        "",
+      ])
+      for ref in bibliography:
+        lines.append(f"[{ref.get('index', '')}] {ref.get('formatted', '')}")
+      lines.append("")
 
   return "\n".join(lines).rstrip() + "\n"
 
 
 def build_docx(project: dict, bibliography: list[dict] | None = None) -> bytes:
-  return result_store.build_docx(build_markdown(project, bibliography))
+  return result_store.build_docx(build_markdown(project, bibliography), first_line_indent=True)
 
 
 def export_filename(project: dict, ext: str) -> str:

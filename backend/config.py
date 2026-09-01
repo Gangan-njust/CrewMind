@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     max_iterations: int = 3
     default_temperature: float = 0.7
 
+    # LLM 调用失败自动重试（网络错误、限流 429、5xx 等瞬时故障）
+    llm_max_retries: int = 2
+    llm_retry_backoff: float = 1.5
+
     data_dir: Path = Path("./data")
     results_dir: Path = Path("./data/results")
     uploads_dir: Path = Path("./data/uploads")
@@ -38,6 +42,32 @@ class Settings(BaseSettings):
     experiment_dir: Path = Path("./data/experiments")
     database_url: str = ""
     literature_analysis_concurrency: int = 3
+    crew_task_concurrency: int = 3
+
+    # RAG 检索增强
+    rag_enabled: bool = True
+    rag_dir: Path = Path("./data/rag")
+    embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    embedding_provider: str = "fastembed"  # fastembed | openai
+    embedding_api_key: str = ""
+    embedding_base_url: str = ""
+    chunk_size: int = 600
+    chunk_overlap: int = 120
+    rag_top_k: int = 8
+    rag_rerank_top_k: int = 5
+    rag_rerank_enabled: bool = True
+    rag_rerank_model: str = "BAAI/bge-reranker-base"
+    rag_section_boost: bool = True
+    rag_index_concurrency: int = 2
+    rag_index_max_retries: int = 2
+    # 语义辅助切块（段落合并决策引入 embedding 相似度信号，默认关闭）
+    rag_semantic_chunking: bool = False
+    rag_semantic_min_sim: float = 0.50   # 相邻段落相似度低于该值时强制切分
+    rag_semantic_max_sim: float = 0.82   # 相邻段落相似度高于该值时允许超限合并
+    rag_semantic_max_ratio: float = 1.30  # 语义合并允许的最大超限比例（相对 chunk_size）
+    # HuggingFace 模型下载（fastembed embedding / rerank）
+    hf_endpoint: str = "https://hf-mirror.com"
+    hf_hub_download_timeout: int = 300
 
     # Semantic Scholar API Key（可选，可提高检索速率限制）
     semantic_scholar_api_key: str = ""
@@ -58,6 +88,7 @@ class Settings(BaseSettings):
         (PROJECT_ROOT / self.uploads_dir).mkdir(parents=True, exist_ok=True)
         (PROJECT_ROOT / self.literature_dir).mkdir(parents=True, exist_ok=True)
         (PROJECT_ROOT / self.experiment_dir).mkdir(parents=True, exist_ok=True)
+        (PROJECT_ROOT / self.rag_dir).mkdir(parents=True, exist_ok=True)
 
 
 settings = Settings()

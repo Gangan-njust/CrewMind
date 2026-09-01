@@ -1,0 +1,74 @@
+{
+  "description": "RAG 召回率黄金 query 基准（合成 chunk，无需真实 PDF）",
+  "recall_at_k": 3,
+  "cases": [
+    {
+      "id": "cv_method",
+      "query": "交叉验证 模型评估",
+      "chunks": [
+        {
+          "chunk_id": "bench-cv-1",
+          "literature_id": "lit-a",
+          "section_key": "introduction",
+          "content": "本文介绍深度学习在图像识别中的应用背景。"
+        },
+        {
+          "chunk_id": "bench-cv-2",
+          "literature_id": "lit-a",
+          "section_key": "methods",
+          "content": "实验采用五折交叉验证评估分类器性能，并使用准确率与 F1 作为指标。"
+        },
+        {
+          "chunk_id": "bench-cv-3",
+          "literature_id": "lit-b",
+          "section_key": "conclusion",
+          "content": "未来工作将探索更大规模预训练模型。"
+        }
+      ],
+      "expected_chunk_ids": ["bench-cv-2"]
+    },
+    {
+      "id": "abstract_boost",
+      "query": "研究目标 摘要",
+      "chunks": [
+        {
+          "chunk_id": "bench-abs-1",
+          "literature_id": "lit-c",
+          "section_key": "abstract",
+          "content": "摘要：本研究旨在提出一种轻量级神经网络架构用于边缘部署。"
+        },
+        {
+          "chunk_id": "bench-abs-2",
+          "literature_id": "lit-c",
+          "section_key": "full",
+          "content": "附录包含额外的超参数表格。"
+        }
+      ],
+      "expected_chunk_ids": ["bench-abs-1"]
+    },
+    {
+      "id": "fts_keyword",
+      "query": "Transformer 注意力机制",
+      "chunks": [
+        {
+          "chunk_id": "bench-fts-1",
+          "literature_id": "lit-d",
+          "section_key": "methods",
+          "content": "模型基于 Transformer 编码器，引入多头自注意力机制捕获长程依赖。"
+        },
+        {
+          "chunk_id": "bench-fts-2",
+          "literature_id": "lit-d",
+          "section_key": "results",
+          "content": "对比实验显示 LSTM 基线在短序列上仍有优势。"
+        }
+      ],
+      "expected_chunk_ids": ["bench-fts-1"]
+    }
+  ],
+  "latency": {
+    "chunk_count": 100,
+    "max_ms_p95": 300,
+    "iterations": 20
+  }
+}

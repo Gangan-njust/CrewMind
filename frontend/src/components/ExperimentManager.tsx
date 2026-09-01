@@ -4,19 +4,26 @@ import {
   BarChart3, GitCompare, FileSpreadsheet, BookOpen, CheckCircle, AlertCircle,
   X, Image as ImageIcon, Link2, Clock, Pencil, ChevronDown, ChevronUp,
   Microscope, StickyNote, Target, Sparkles, Check, ZoomIn,
+  Settings2, TrendingUp, FolderArchive, History, Download, RotateCcw,
+  FileCode, Layers, Gauge,
 } from 'lucide-react'
 import {
-  fetchExperiments, fetchExperiment, createExperiment, deleteExperiment,
+  fetchExperiments, fetchExperiment, createExperiment, deleteExperiment, updateExperiment,
   createExperimentEntry, updateExperimentEntry, deleteExperimentEntry,
   uploadExperimentAttachment, uploadExperimentDataset,
   analyzeExperimentDataset, compareExperimentData,
   createExperimentFromWorkflow, fetchHistory,
+  updateExperimentConfig, recordExperimentMetrics,
+  fetchMetricChart, uploadExperimentFile, deleteExperimentFile,
+  compareExperimentsMulti, generateReproducePackage,
   type Experiment, type ExperimentSummary, type ExperimentEntry,
   type ExperimentAnalysis, type ComparisonResult, type HistoryRecord,
-  type ExperimentDataset,
+  type ExperimentDataset, type ExperimentMetric, type ExperimentFile,
+  type ExperimentStep, type MetricChartResult, type MultiCompareResult,
+  type ReproduceResult,
 } from '../api'
 
-type Tab = 'eln' | 'data' | 'compare'
+type Tab = 'eln' | 'data' | 'metrics' | 'files' | 'config' | 'compare'
 
 const ENTRY_TYPE_META: Record<string, { label: string; Icon: typeof BookOpen; color: string }> = {
   observation: { label: '观察记录', Icon: Microscope, color: 'var(--info)' },
@@ -32,6 +39,30 @@ const COMPARE_STATUS: Record<string, { label: string; color: string }> = {
   no_data: { label: '无数据', color: 'var(--text-muted)' },
 }
 
+const EXP_STATUS: Record<string, { label: string; color: string }> = {
+  planned: { label: '已计划', color: 'var(--info)' },
+  active: { label: '进行中', color: 'var(--accent)' },
+  paused: { label: '已暂停', color: 'var(--warning)' },
+  completed: { label: '已完成', color: 'var(--success)' },
+  archived: { label: '已归档', color: 'var(--text-muted)' },
+  failed: { label: '失败', color: 'var(--danger)' },
+}
+
+const FILE_TYPE_META: Record<string, { label: string; Icon: typeof FileCode; color: string }> = {
+  model: { label: '模型', Icon: Layers, color: 'var(--accent)' },
+  log: { label: '日志', Icon: History, color: 'var(--info)' },
+  script: { label: '脚本', Icon: FileCode, color: 'var(--success)' },
+  other: { label: '其他', Icon: FolderArchive, color: 'var(--text-muted)' },
+}
+
+const CONFIG_PRESETS: { key: string; label: string; placeholder: string }[] = [
+  { key: 'learning_rate', label: '学习率', placeholder: '例如 0.001' },
+  { key: 'batch_size', label: 'Batch Size', placeholder: '例如 32' },
+  { key: 'epochs', label: '训练轮数', placeholder: '例如 100' },
+  { key: 'optimizer', label: '优化器', placeholder: '例如 adam / sgd' },
+  { key: 'seed', label: '随机种子', placeholder: '例如 42' },
+]
+
 function attachmentSrc(url: string): string {
   const token = localStorage.getItem('crewmind-token')
   if (!token) return url
@@ -43,6 +74,14 @@ function formatDate(iso: string) {
   return new Date(iso).toLocaleString('zh-CN', {
     month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
   })
+}
+
+function formatFileSize(bytes: number) {
+  if (!bytes) return '0 B'
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
 }
 
 function KeyValueGrid({ data, label }: { data: Record<string, unknown>; label: string }) {
@@ -99,6 +138,35 @@ export function ExperimentManager({ workflowRecordId }: Props) {
   const [expandedDatasets, setExpandedDatasets] = useState<Set<string>>(new Set())
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null)
 
+  // 配置管理
+  const [configForm, setConfigForm] = useState({
+    hyperparameters: '',
+    environment: '',
+    code_version: '',
+    entrypoint: '',
+  })
+  const [savingConfig, setSavingConfig] = useState(false)
+
+  // 训练指标
+  const [metricForm, setMetricForm] = useState({ metric_name: '', step: '', value: '', unit: '' })
+  const [metricNames, setMetricNames] = useState<string[]>([])
+  const [selectedMetric, setSelectedMetric] = useState('')
+  const [metricChart, setMetricChart] = useState<MetricChartResult | null>(null)
+  const [savingMetric, setSavingMetric] = useState(false)
+
+  // 实验文件
+  const [uploadingFile, setUploadingFile] = useState(false)
+  const [fileType, setFileType] = useState<'model' | 'log' | 'script' | 'other'>('model')
+
+  // 多实验对比
+  const [compareIds, setCompareIds] = useState<string[]>([])
+  const [multiResult, setMultiResult] = useState<MultiCompareResult | null>(null)
+  const [comparingMulti, setComparingMulti] = useState(false)
+
+  // 一键复现
+  const [reproduce, setReproduce] = useState<ReproduceResult | null>(null)
+  const [buildingReproduce, setBuildingReproduce] = useState(false)
+
   const [createForm, setCreateForm] = useState({ title: '', description: '' })
   const [workflowForm, setWorkflowForm] = useState({ recordId: '', title: '' })
   const [entryForm, setEntryForm] = useState({
@@ -109,6 +177,7 @@ export function ExperimentManager({ workflowRecordId }: Props) {
 
   const photoRef = useRef<HTMLInputElement>(null)
   const dataRef = useRef<HTMLInputElement>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
   const toastTimer = useRef<ReturnType<typeof setTimeout>>()
   const entryFormRef = useRef<HTMLDivElement>(null)
 
@@ -136,7 +205,25 @@ export function ExperimentManager({ workflowRecordId }: Props) {
       setActive(data)
       setAnalysis(null)
       setComparison(null)
+      setMultiResult(null)
+      setReproduce(null)
       setTab('eln')
+      const cfg = (data.config || {}) as Record<string, unknown>
+      const hp = cfg.hyperparameters || {}
+      setConfigForm({
+        hyperparameters: typeof hp === 'string' ? hp : JSON.stringify(hp, null, 2),
+        environment: typeof cfg.environment === 'string'
+          ? cfg.environment
+          : JSON.stringify(cfg.environment || {}, null, 2),
+        code_version: typeof cfg.code_version === 'string'
+          ? cfg.code_version
+          : JSON.stringify(cfg.code_version || {}, null, 2),
+        entrypoint: String(cfg.entrypoint || ''),
+      })
+      const names = Array.from(new Set(data.metrics.map(m => m.metric_name)))
+      setMetricNames(names)
+      setSelectedMetric(names[0] || '')
+      setMetricChart(null)
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : '加载失败')
     } finally {
@@ -336,6 +423,192 @@ export function ExperimentManager({ workflowRecordId }: Props) {
     }
   }
 
+  const parseConfigText = (text: string): Record<string, unknown> => {
+    const trimmed = text.trim()
+    if (!trimmed) return {}
+    try {
+      const parsed = JSON.parse(trimmed)
+      return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : { value: parsed }
+    } catch {
+      // 宽松解析：k=v 或 yaml 风格 k: v
+      const obj: Record<string, unknown> = {}
+      for (const line of trimmed.split('\n')) {
+        const m = line.match(/^\s*["']?([\w.\-]+)["']?\s*[:=]\s*(.+)\s*$/)
+        if (m) {
+          const val = m[2].trim()
+          obj[m[1]] = val.startsWith('"') && val.endsWith('"') ? val.slice(1, -1) : val
+        }
+      }
+      return obj
+    }
+  }
+
+  const handleSaveConfig = async () => {
+    if (!active) return
+    setSavingConfig(true)
+    try {
+      const hp = parseConfigText(configForm.hyperparameters)
+      const env = parseConfigText(configForm.environment)
+      const cv = parseConfigText(configForm.code_version)
+      const config: Record<string, unknown> = {
+        hyperparameters: hp,
+        environment: env,
+        code_version: cv,
+        entrypoint: configForm.entrypoint.trim(),
+      }
+      const data = await updateExperimentConfig(active.id, config)
+      setActive(data)
+      showToast('实验配置已保存')
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '保存配置失败')
+    } finally {
+      setSavingConfig(false)
+    }
+  }
+
+  const handleUpdateProgress = async (payload: {
+    progress?: number
+    current_step?: string
+    status?: string
+    steps?: ExperimentStep[]
+  }) => {
+    if (!active) return
+    setSavingConfig(true)
+    try {
+      const data = await updateExperiment(active.id, payload)
+      setActive(data)
+      showToast('实验进度已更新')
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '保存进度失败')
+    } finally {
+      setSavingConfig(false)
+    }
+  }
+
+  const handleToggleStep = async (step: ExperimentStep) => {
+    if (!active) return
+    const steps = active.steps.map(s =>
+      s.id === step.id ? { ...s, status: s.status === 'done' ? 'todo' : 'done' } : s
+    )
+    const done = steps.filter(s => s.status === 'done').length
+    const progress = steps.length ? Math.round((done / steps.length) * 100) : active.progress
+    await handleUpdateProgress({ steps, progress, current_step: step.id === active.current_step ? '' : step.id })
+  }
+
+  const handleSetCurrentStep = async (stepId: string) => {
+    if (!active) return
+    await handleUpdateProgress({ current_step: stepId })
+  }
+
+  const handleRecordMetric = async () => {
+    if (!active || !metricForm.metric_name.trim()) return
+    setSavingMetric(true)
+    try {
+      const items = [{
+        metric_name: metricForm.metric_name.trim(),
+        step: Number(metricForm.step) || 0,
+        value: Number(metricForm.value),
+        unit: metricForm.unit.trim(),
+      }]
+      if (!metricForm.value) {
+        setError('请输入指标数值')
+        setSavingMetric(false)
+        return
+      }
+      const saved = await recordExperimentMetrics(active.id, items)
+      setActive(prev => prev ? {
+        ...prev,
+        metrics: [...prev.metrics, ...saved],
+        metric_count: prev.metric_count + saved.length,
+      } : prev)
+      setMetricForm({ metric_name: metricForm.metric_name, step: '', value: '', unit: metricForm.unit })
+      setMetricNames(prev => prev.includes(metricForm.metric_name) ? prev : [...prev, metricForm.metric_name])
+      setSelectedMetric(metricForm.metric_name)
+      await refreshMetricChart(metricForm.metric_name)
+      showToast('指标已记录')
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '记录指标失败')
+    } finally {
+      setSavingMetric(false)
+    }
+  }
+
+  const refreshMetricChart = async (name: string) => {
+    if (!active) return
+    try {
+      const chart = await fetchMetricChart(active.id, name)
+      setMetricChart(chart.empty ? null : chart)
+    } catch {
+      setMetricChart(null)
+    }
+  }
+
+  const handleSelectMetric = async (name: string) => {
+    setSelectedMetric(name)
+    setMetricChart(null)
+    await refreshMetricChart(name)
+  }
+
+  const handleFileUpload = async (files: FileList | null) => {
+    if (!files?.length || !active) return
+    setUploadingFile(true)
+    try {
+      for (const file of Array.from(files)) {
+        await uploadExperimentFile(active.id, file, fileType)
+      }
+      await loadDetail(active.id)
+      setTab('files')
+      showToast('实验文件已上传')
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '上传失败')
+    } finally {
+      setUploadingFile(false)
+    }
+  }
+
+  const handleDeleteFile = async (fileId: string) => {
+    if (!confirm('删除该文件版本？')) return
+    try {
+      await deleteExperimentFile(fileId)
+      if (active) {
+        const currentTab = tab
+        await loadDetail(active.id)
+        setTab(currentTab)
+      }
+      showToast('文件已删除')
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '删除失败')
+    }
+  }
+
+  const handleCompareMulti = async () => {
+    if (!active || compareIds.length === 0) return
+    setComparingMulti(true)
+    try {
+      const result = await compareExperimentsMulti(compareIds)
+      setMultiResult(result)
+      showToast('多实验对比完成')
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '多实验对比失败')
+    } finally {
+      setComparingMulti(false)
+    }
+  }
+
+  const handleGenerateReproduce = async () => {
+    if (!active) return
+    setBuildingReproduce(true)
+    try {
+      const result = await generateReproducePackage(active.id, configForm.entrypoint.trim())
+      setReproduce(result)
+      showToast('复现包已生成')
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '生成复现包失败')
+    } finally {
+      setBuildingReproduce(false)
+    }
+  }
+
   const startEditEntry = (entry: ExperimentEntry) => {
     setEditingEntry(entry)
     setShowEntryForm(true)
@@ -422,17 +695,80 @@ export function ExperimentManager({ workflowRecordId }: Props) {
             <ChevronLeft size={18} /> 返回列表
           </button>
           <div className="exp-detail-title-block">
-            <h2>{active.title}</h2>
+            <div className="exp-detail-title-row">
+              <h2>{active.title}</h2>
+              <select
+                className="form-select exp-status-select"
+                value={active.status}
+                onChange={e => handleUpdateProgress({ status: e.target.value })}
+              >
+                {Object.entries(EXP_STATUS).map(([k, v]) => (
+                  <option key={k} value={k}>{v.label}</option>
+                ))}
+              </select>
+            </div>
             <div className="exp-detail-meta">
               {active.source_workflow_id && (
                 <span className="exp-chip linked"><Link2 size={12} /> 已关联方案</span>
               )}
               <span className="exp-chip"><BookOpen size={12} /> {active.entries.length} 条记录</span>
               <span className="exp-chip"><FileSpreadsheet size={12} /> {active.datasets.length} 个数据集</span>
+              <span className="exp-chip"><TrendingUp size={12} /> {active.metric_count} 项指标</span>
+              <span className="exp-chip"><FolderArchive size={12} /> {active.file_count} 个文件</span>
               <span className="exp-chip muted"><Clock size={12} /> 更新于 {formatDate(active.updated_at)}</span>
             </div>
           </div>
         </header>
+
+        <section className="exp-progress-card card">
+          <div className="exp-progress-head">
+            <span className="exp-field-label"><Gauge size={13} /> 实验进度
+              {active.current_step && <em className="exp-progress-current">当前：{active.current_step}</em>}
+            </span>
+            <div className="exp-progress-actions">
+              {[25, 50, 75, 100].map(p => (
+                <button key={p} type="button" className={`btn btn-outline btn-sm ${active.progress === p ? 'active' : ''}`}
+                  onClick={() => handleUpdateProgress({ progress: p })}>
+                  {p}%
+                </button>
+              ))}
+              <input
+                type="number" min={0} max={100}
+                className="form-input exp-progress-input"
+                defaultValue={active.progress}
+                key={`${active.id}-${active.progress}`}
+                onBlur={e => {
+                  const v = Math.max(0, Math.min(100, Number(e.target.value) || 0))
+                  if (v !== active.progress) handleUpdateProgress({ progress: v })
+                }}
+              />
+              <span className="exp-progress-pct">{active.progress}%</span>
+            </div>
+          </div>
+          <div className="exp-progress-bar">
+            <span style={{ width: `${Math.max(0, Math.min(100, active.progress))}%` }} />
+          </div>
+          {active.steps.length > 0 && (
+            <div className="exp-steps">
+              {active.steps.map((step, i) => {
+                const done = step.status === 'done'
+                const current = active.current_step === step.id
+                return (
+                  <button
+                    key={step.id || i}
+                    type="button"
+                    className={`exp-step-chip ${done ? 'done' : ''} ${current ? 'current' : ''}`}
+                    onClick={() => done ? handleSetCurrentStep(step.id) : handleToggleStep(step)}
+                    title="点击标记完成，再点设为当前阶段"
+                  >
+                    <span className="exp-step-index">{i + 1}</span>
+                    {step.name}
+                  </button>
+                )
+              })}
+            </div>
+          )}
+        </section>
 
         {active.description && (
           <p className="exp-detail-desc">{active.description}</p>
@@ -442,6 +778,9 @@ export function ExperimentManager({ workflowRecordId }: Props) {
           {([
             { id: 'eln' as Tab, label: '实验记录本', icon: BookOpen, count: active.entries.length },
             { id: 'data' as Tab, label: '数据分析', icon: BarChart3, count: active.datasets.length },
+            { id: 'metrics' as Tab, label: '训练指标', icon: TrendingUp, count: active.metrics.length },
+            { id: 'files' as Tab, label: '实验文件', icon: FolderArchive, count: active.file_count },
+            { id: 'config' as Tab, label: '配置与复现', icon: Settings2, count: 0 },
             { id: 'compare' as Tab, label: '方案对比', icon: GitCompare, count: active.expected_metrics.length },
           ]).map(({ id, label, icon: Icon, count }) => (
             <button
@@ -699,6 +1038,299 @@ export function ExperimentManager({ workflowRecordId }: Props) {
               </div>
             )}
 
+            {tab === 'metrics' && (
+              <div className="exp-metrics">
+                <div className="exp-metric-form card">
+                  <h3><TrendingUp size={18} /> 记录训练指标</h3>
+                  <div className="exp-form-row">
+                    <input className="form-input" placeholder="指标名称（如 loss / accuracy）" value={metricForm.metric_name}
+                      onChange={e => setMetricForm(f => ({ ...f, metric_name: e.target.value }))} />
+                    <input className="form-input" type="number" placeholder="step / epoch" value={metricForm.step}
+                      onChange={e => setMetricForm(f => ({ ...f, step: e.target.value }))} />
+                    <input className="form-input" type="number" placeholder="数值" value={metricForm.value}
+                      onChange={e => setMetricForm(f => ({ ...f, value: e.target.value }))} />
+                    <input className="form-input" placeholder="单位（可选）" value={metricForm.unit}
+                      onChange={e => setMetricForm(f => ({ ...f, unit: e.target.value }))} />
+                  </div>
+                  <div className="exp-form-actions">
+                    <button type="button" className="btn btn-primary"
+                      disabled={savingMetric || !metricForm.metric_name.trim() || metricForm.value === ''}
+                      onClick={handleRecordMetric}>
+                      {savingMetric ? <Loader size={16} className="spinner" /> : <Plus size={16} />}
+                      记录指标
+                    </button>
+                  </div>
+                </div>
+
+                {metricNames.length === 0 ? (
+                  <div className="exp-empty-inline compact">
+                    <TrendingUp size={32} strokeWidth={1.2} />
+                    <p>暂无训练指标</p>
+                    <span>记录 loss、accuracy 等指标后，系统将自动生成学习曲线。</span>
+                  </div>
+                ) : (
+                  <div className="exp-metric-body">
+                    <div className="exp-metric-selector">
+                      {metricNames.map(name => (
+                        <button key={name} type="button"
+                          className={`exp-metric-chip ${selectedMetric === name ? 'active' : ''}`}
+                          onClick={() => handleSelectMetric(name)}>
+                          {name}
+                        </button>
+                      ))}
+                    </div>
+                    {metricChart && metricChart.image_base64 && (
+                      <figure className="exp-chart-card exp-metric-chart">
+                        <figcaption>{metricChart.title}</figcaption>
+                        <img src={`data:image/png;base64,${metricChart.image_base64}`} alt={metricChart.title} />
+                      </figure>
+                    )}
+                    {active.metrics.length > 0 && (
+                      <div className="exp-metric-table-wrap">
+                        <table className="exp-preview-table">
+                          <thead>
+                            <tr><th>指标</th><th>Step</th><th>值</th><th>单位</th><th>记录时间</th></tr>
+                          </thead>
+                          <tbody>
+                            {active.metrics.slice().reverse().slice(0, 50).map(m => (
+                              <tr key={m.id}>
+                                <td>{m.metric_name}</td>
+                                <td>{m.step}</td>
+                                <td><b>{m.value}</b></td>
+                                <td>{m.unit}</td>
+                                <td className="muted">{formatDate(m.created_at)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+
+            {tab === 'files' && (
+              <div className="exp-files">
+                <div className="exp-file-upload card">
+                  <h3><FolderArchive size={18} /> 实验文件管理</h3>
+                  <p className="form-hint">上传模型、日志、脚本等实验产物；同名文件自动递增版本号，保留全部历史版本。</p>
+                  <div className="exp-form-row">
+                    <select className="form-select" value={fileType}
+                      onChange={e => setFileType(e.target.value as 'model' | 'log' | 'script' | 'other')}>
+                      <option value="model">模型文件</option>
+                      <option value="log">训练日志</option>
+                      <option value="script">脚本</option>
+                      <option value="other">其他</option>
+                    </select>
+                    <button type="button" className="btn btn-primary" disabled={uploadingFile}
+                      onClick={() => fileRef.current?.click()}>
+                      {uploadingFile ? <Loader size={16} className="spinner" /> : <Upload size={16} />}
+                      {uploadingFile ? '上传中…' : '选择文件上传'}
+                    </button>
+                  </div>
+                </div>
+
+                {active.files.length === 0 ? (
+                  <div className="exp-empty-inline compact">
+                    <FolderArchive size={32} strokeWidth={1.2} />
+                    <p>暂无实验文件</p>
+                    <span>模型权重、训练日志与复现脚本都可上传，并自动保留版本历史。</span>
+                  </div>
+                ) : (
+                  <div className="exp-file-list">
+                    {active.files.map(f => {
+                      const meta = FILE_TYPE_META[f.file_type] || FILE_TYPE_META.other
+                      const TypeIcon = meta.Icon
+                      return (
+                        <div key={f.id} className="exp-file-card card">
+                          <div className="exp-file-icon" style={{ color: meta.color }}><TypeIcon size={20} /></div>
+                          <div className="exp-file-info">
+                            <strong>{f.filename}</strong>
+                            <div className="exp-file-meta">
+                              <span className="exp-chip" style={{ color: meta.color }}>{meta.label}</span>
+                              <span className="exp-chip">v{f.version}</span>
+                              <span className="exp-chip muted">{formatFileSize(f.file_size)}</span>
+                              <span className="exp-chip muted">{formatDate(f.created_at)}</span>
+                            </div>
+                          </div>
+                          <div className="exp-file-actions">
+                            <a className="btn btn-outline btn-sm" href={attachmentSrc(f.url)} target="_blank" rel="noreferrer">
+                              <Download size={14} /> 下载
+                            </a>
+                            <button type="button" className="btn-icon danger" title="删除此版本" onClick={() => handleDeleteFile(f.id)}>
+                              <Trash2 size={15} />
+                            </button>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+
+            {tab === 'config' && (
+              <div className="exp-config">
+                <section className="exp-config-form card">
+                  <h3><Settings2 size={18} /> 实验配置</h3>
+                  <p className="form-hint">记录超参数、运行环境与代码版本，作为结果可复现的依据。</p>
+                  <div className="exp-config-grid">
+                    <div>
+                      <label className="exp-field-label">超参数（JSON 或 k=v）</label>
+                      <textarea className="form-textarea exp-code-input" rows={6} value={configForm.hyperparameters}
+                        placeholder={'{\n  "learning_rate": 0.001,\n  "batch_size": 32,\n  "epochs": 100\n}'}
+                        onChange={e => setConfigForm(f => ({ ...f, hyperparameters: e.target.value }))} />
+                    </div>
+                    <div>
+                      <label className="exp-field-label">运行环境</label>
+                      <textarea className="form-textarea exp-code-input" rows={6} value={configForm.environment}
+                        placeholder={'{\n  "python_version": "3.12",\n  "os": "ubuntu-22.04",\n  "python_packages": ["torch==2.1.0"]\n}'}
+                        onChange={e => setConfigForm(f => ({ ...f, environment: e.target.value }))} />
+                    </div>
+                    <div>
+                      <label className="exp-field-label">代码版本</label>
+                      <textarea className="form-textarea exp-code-input" rows={6} value={configForm.code_version}
+                        placeholder={'{\n  "repo": "my-lab/train",\n  "git_commit": "abc1234"\n}'}
+                        onChange={e => setConfigForm(f => ({ ...f, code_version: e.target.value }))} />
+                    </div>
+                  </div>
+                  <div className="exp-form-row">
+                    <input className="form-input" placeholder="复现入口命令，如 python train.py --config config.yaml"
+                      value={configForm.entrypoint}
+                      onChange={e => setConfigForm(f => ({ ...f, entrypoint: e.target.value }))} />
+                    <button type="button" className="btn btn-primary" disabled={savingConfig} onClick={handleSaveConfig}>
+                      {savingConfig ? <Loader size={16} className="spinner" /> : <Check size={16} />}
+                      保存配置
+                    </button>
+                  </div>
+                </section>
+
+                <section className="exp-reproduce card">
+                  <h3><RotateCcw size={18} /> 一键复现</h3>
+                  <p className="form-hint">基于当前配置生成复现包（配置快照 + 环境依赖 + 运行脚本），可下载压缩包并在本地重跑实验。</p>
+                  <div className="exp-form-actions">
+                    <button type="button" className="btn btn-primary" disabled={buildingReproduce} onClick={handleGenerateReproduce}>
+                      {buildingReproduce ? <Loader size={16} className="spinner" /> : <RotateCcw size={16} />}
+                      {buildingReproduce ? '生成中…' : '生成复现包'}
+                    </button>
+                  </div>
+                  {reproduce && (
+                    <div className="exp-reproduce-result fade-in">
+                      <div className="exp-reproduce-head">
+                        <span className="exp-chip" style={{ color: 'var(--success)' }}>
+                          <CheckCircle size={12} /> 已生成 {formatDate(reproduce.generated_at)}
+                        </span>
+                        <a className="btn btn-outline btn-sm" href={attachmentSrc(reproduce.download_url)}>
+                          <Download size={14} /> 下载复现包 (zip)
+                        </a>
+                      </div>
+                      <ul className="exp-reproduce-files">
+                        {reproduce.files.map(f => (
+                          <li key={f.filename}><FileCode size={14} /> {f.filename}
+                            <span className="muted">{formatFileSize(f.size)}</span></li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </section>
+
+                <section className="exp-multi-compare card">
+                  <h3><GitCompare size={18} /> 多实验横向对比</h3>
+                  <p className="exp-compare-hint">选择其他实验进行横向对比，比较状态、进度与训练指标曲线。</p>
+                  <div className="exp-multi-select">
+                    <label className="exp-field-label">选择对比实验（可多选）</label>
+                    {experiments.filter(e => e.id !== active.id).length === 0 ? (
+                      <p className="form-hint">暂无其他实验可选，请先新建实验。</p>
+                    ) : (
+                      <div className="exp-multi-checkbox-list">
+                        {experiments.filter(e => e.id !== active.id).map(e => {
+                          const checked = compareIds.includes(e.id)
+                          return (
+                            <label key={e.id} className={`exp-multi-item ${checked ? 'checked' : ''}`}>
+                              <input type="checkbox" checked={checked}
+                                onChange={() => setCompareIds(prev =>
+                                  checked ? prev.filter(x => x !== e.id) : [...prev, e.id]
+                                )} />
+                              {e.title}
+                            </label>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
+                  <div className="exp-form-actions">
+                    <button type="button" className="btn btn-primary" disabled={comparingMulti || compareIds.length === 0}
+                      onClick={handleCompareMulti}>
+                      {comparingMulti ? <Loader size={16} className="spinner" /> : <GitCompare size={16} />}
+                      {comparingMulti ? '对比中…' : '开始对比'}
+                    </button>
+                  </div>
+
+                  {multiResult && (
+                    <div className="exp-multi-result fade-in">
+                      <p className="exp-compare-summary-text">{multiResult.summary}</p>
+                      {multiResult.charts.length > 0 && (
+                        <div className="exp-charts-grid">
+                          {multiResult.charts.map((chart, i) => (
+                            <figure key={i} className="exp-chart-card">
+                              <figcaption>{chart.title}</figcaption>
+                              <img src={`data:image/png;base64,${chart.image_base64}`} alt={chart.title} />
+                            </figure>
+                          ))}
+                        </div>
+                      )}
+                      <div className="exp-multi-table-wrap">
+                        <table className="exp-preview-table">
+                          <thead>
+                            <tr>
+                              <th>实验</th><th>状态</th><th>进度</th><th>记录</th><th>数据集</th><th>指标</th><th>文件</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {multiResult.experiments.map(e => (
+                              <tr key={e.experiment_id}>
+                                <td><b>{e.title}</b></td>
+                                <td>{e.status_label}</td>
+                                <td>{e.progress}%</td>
+                                <td>{e.entry_count}</td>
+                                <td>{e.dataset_count}</td>
+                                <td>{e.metric_count}</td>
+                                <td>{e.file_count}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      {multiResult.metric_names.length > 0 && (
+                        <div className="exp-multi-metrics">
+                          {multiResult.metric_names.map(name => (
+                            <div key={name} className="exp-kv-block">
+                              <span className="exp-field-label">指标「{name}」末值对比</span>
+                              <div className="exp-kv-grid">
+                                {multiResult.experiments.map(e => {
+                                  const sum = e.metric_summaries[name]
+                                  return (
+                                    <div key={e.experiment_id} className="exp-kv-item">
+                                      <span className="exp-kv-key">{e.title}</span>
+                                      <span className="exp-kv-val">{sum && sum.last != null ? sum.last : '—'}</span>
+                                    </div>
+                                  )
+                                })}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </section>
+              </div>
+            )}
+
+
             {tab === 'compare' && (
               <div className="exp-compare">
                 <div className="exp-compare-toolbar card">
@@ -793,6 +1425,8 @@ export function ExperimentManager({ workflowRecordId }: Props) {
           }} />
         <input ref={dataRef} type="file" accept=".csv,.xlsx,.xls" multiple hidden
           onChange={e => { handleDataUpload(e.target.files); e.target.value = '' }} />
+        <input ref={fileRef} type="file" multiple hidden
+          onChange={e => { handleFileUpload(e.target.files); e.target.value = '' }} />
 
         {lightboxSrc && (
           <div className="modal-overlay exp-lightbox" onClick={() => setLightboxSrc(null)}>
@@ -865,6 +1499,10 @@ export function ExperimentManager({ workflowRecordId }: Props) {
             >
               <div className="exp-card-top">
                 <span className={`exp-status-dot ${exp.status}`} />
+                {(() => {
+                  const st = EXP_STATUS[exp.status] || EXP_STATUS.active
+                  return <span className="exp-chip sm" style={{ color: st.color, borderColor: st.color }}>{st.label}</span>
+                })()}
                 <button
                   type="button"
                   className="btn-icon danger exp-card-delete"
@@ -876,9 +1514,15 @@ export function ExperimentManager({ workflowRecordId }: Props) {
               </div>
               <h3>{exp.title}</h3>
               {exp.description && <p className="exp-card-desc">{exp.description}</p>}
+              <div className="exp-card-progress">
+                <div className="exp-progress-bar sm"><span style={{ width: `${Math.max(0, Math.min(100, exp.progress))}%` }} /></div>
+                <span className="exp-card-progress-pct">{exp.progress}%</span>
+              </div>
               <footer className="exp-card-footer">
                 <span><BookOpen size={13} /> {exp.entry_count} 记录</span>
                 <span><FileSpreadsheet size={13} /> {exp.dataset_count} 数据集</span>
+                <span><TrendingUp size={13} /> {exp.metric_count} 指标</span>
+                <span><FolderArchive size={13} /> {exp.file_count} 文件</span>
                 {exp.source_workflow_id && (
                   <span className="exp-chip linked sm"><Link2 size={11} /> 已关联</span>
                 )}

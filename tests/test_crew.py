@@ -1,6 +1,8 @@
 """Crew 任务依赖、暂停/恢复与人机审核"""
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from backend.crew.engine import Crew, CrewSuspended, TaskResult
@@ -109,6 +111,78 @@ class TestTaskDependencies:
     assert c.results["task_b"].status == TaskStatus.FAILED
     assert "依赖任务 task_a 未完成" in c.results["task_b"].error
     assert c.status == "failed"
+
+
+class TestParallelExecution:
+  @pytest.mark.asyncio
+  async def test_runs_independent_tasks_concurrently(self, monkeypatch):
+    tasks = [
+      TaskDefinition(
+        id="task_a",
+        name="A",
+        description="",
+        agent_id="planner",
+        depends_on=["task_root"],
+      ),
+      TaskDefinition(
+        id="task_b",
+        name="B",
+        description="",
+        agent_id="planner",
+        depends_on=["task_root"],
+      ),
+      TaskDefinition(
+        id="task_c",
+        name="C",
+        description="",
+        agent_id="planner",
+        depends_on=["task_root"],
+      ),
+      TaskDefinition(
+        id="task_final",
+        name="Final",
+        description="",
+        agent_id="planner",
+        depends_on=["task_a", "task_b", "task_c"],
+      ),
+    ]
+    c = Crew(scenario="test", user_input="需求", tasks=tasks)
+    c.results["task_root"] = TaskResult(
+      task_id="task_root",
+      status=TaskStatus.COMPLETED,
+      output="root-output",
+    )
+    c.status = "running"
+
+    events: list[tuple[str, str]] = []
+    gate = asyncio.Event()
+
+    async def delayed_execute(self, task_id, agent, prompt, task_context, feedback="", partial_output=""):
+      events.append(("start", task_id))
+      await gate.wait()
+      events.append(("end", task_id))
+      self.results[task_id] = TaskResult(
+        task_id=task_id,
+        status=TaskStatus.COMPLETED,
+        output=f"output-{task_id}",
+      )
+      return self.results[task_id].output
+
+    monkeypatch.setattr(Crew, "_execute_agent", delayed_execute)
+
+    run_task = asyncio.create_task(c._execute_from_index(0))
+    await asyncio.sleep(0.05)
+    started = [task_id for kind, task_id in events if kind == "start"]
+    assert set(started) == {"task_a", "task_b", "task_c"}
+    assert not any(kind == "end" for kind, _ in events)
+
+    gate.set()
+    await run_task
+
+    assert c.status == "completed"
+    assert c.results["task_final"].status == TaskStatus.COMPLETED
+    ended = [task_id for kind, task_id in events if kind == "end"]
+    assert set(ended) == {"task_a", "task_b", "task_c", "task_final"}
 
 
 class TestSuspendAndResume:
@@ -260,3 +334,194 @@ class TestHumanReview:
     assert "crew_started" in event_types
     assert "task_started" in event_types
     assert "human_review_required" in event_types
+
+
+class TestRetryTask:
+  @pytest.mark.asyncio
+  async def test_retry_reruns_failed_and_downstream_only(self, monkeypatch):
+    tasks = [
+      TaskDefinition(id="task_a", name="A", description="", agent_id="planner", depends_on=[]),
+      TaskDefinition(id="task_b", name="B", description="", agent_id="planner", depends_on=["task_a"]),
+      TaskDefinition(id="task_c", name="C", description="", agent_id="planner", depends_on=["task_b"]),
+    ]
+    c = Crew(scenario="test", user_input="需求", tasks=tasks)
+    # 模拟失败现场：task_a 已完成，task_b 失败，task_c 因依赖未满足而失败
+    c.results["task_a"] = TaskResult(task_id="task_a", status=TaskStatus.COMPLETED, output="A-output")
+    c.results["task_b"] = TaskResult(task_id="task_b", status=TaskStatus.FAILED, output="", error="boom")
+    c.results["task_c"] = TaskResult(task_id="task_c", status=TaskStatus.FAILED, output="", error="依赖任务 task_b 未完成")
+    c.status = "failed"
+
+    log: list[str] = []
+
+    async def mock_execute(self, task_id, agent, prompt, task_context, feedback="", partial_output="", revision_base=""):
+      log.append(task_id)
+      result = self.results.get(task_id) or TaskResult(task_id=task_id, status=TaskStatus.RUNNING)
+      result.output = f"output-{task_id}"
+      self.results[task_id] = result
+      return result.output
+
+    monkeypatch.setattr(Crew, "_execute_agent", mock_execute)
+
+    await c.retry_task("task_b")
+
+    assert c.status == "completed"
+    assert log == ["task_b", "task_c"]
+    # 已完成的上游任务不重复执行、不覆盖
+    assert c.results["task_a"].status == TaskStatus.COMPLETED
+    assert c.results["task_a"].output == "A-output"
+    assert c.results["task_b"].status == TaskStatus.COMPLETED
+    assert c.results["task_c"].status == TaskStatus.COMPLETED
+
+  @pytest.mark.asyncio
+  async def test_retry_preserves_sibling_tasks(self, monkeypatch):
+    """失败任务的重试不影响并行完成的其他任务"""
+    tasks = [
+      TaskDefinition(id="task_a", name="A", description="", agent_id="planner", depends_on=[]),
+      TaskDefinition(id="task_b", name="B", description="", agent_id="planner", depends_on=["task_a"]),
+      TaskDefinition(id="task_c", name="C", description="", agent_id="planner", depends_on=["task_a"]),
+    ]
+    c = Crew(scenario="test", user_input="需求", tasks=tasks)
+    c.results["task_a"] = TaskResult(task_id="task_a", status=TaskStatus.COMPLETED, output="A")
+    c.results["task_b"] = TaskResult(task_id="task_b", status=TaskStatus.FAILED, output="", error="boom")
+    c.results["task_c"] = TaskResult(task_id="task_c", status=TaskStatus.COMPLETED, output="C-output")
+    c.status = "failed"
+
+    async def mock_execute(self, task_id, agent, prompt, task_context, feedback="", partial_output="", revision_base=""):
+      result = self.results.get(task_id) or TaskResult(task_id=task_id, status=TaskStatus.RUNNING)
+      result.output = f"output-{task_id}"
+      self.results[task_id] = result
+      return result.output
+
+    monkeypatch.setattr(Crew, "_execute_agent", mock_execute)
+
+    await c.retry_task("task_b")
+
+    assert c.status == "completed"
+    assert c.results["task_c"].output == "C-output"
+    assert c.results["task_b"].output == "output-task_b"
+
+  @pytest.mark.asyncio
+  async def test_retry_rejects_non_failed_crew(self, crew, mock_execute_agent):
+    with pytest.raises(ValueError, match="仅失败的工作流"):
+      await crew.retry_task("task_a")
+
+  @pytest.mark.asyncio
+  async def test_retry_rejects_non_failed_task(self):
+    tasks = [
+      TaskDefinition(id="task_a", name="A", description="", agent_id="planner", depends_on=[]),
+      TaskDefinition(id="task_b", name="B", description="", agent_id="planner", depends_on=["task_a"]),
+    ]
+    c = Crew(scenario="test", user_input="需求", tasks=tasks)
+    c.status = "failed"
+    c.results["task_a"] = TaskResult(task_id="task_a", status=TaskStatus.COMPLETED, output="A")
+    c.results["task_b"] = TaskResult(task_id="task_b", status=TaskStatus.PENDING)
+
+    with pytest.raises(ValueError, match="未处于失败状态"):
+      await c.retry_task("task_a")
+
+  @pytest.mark.asyncio
+  async def test_retry_emits_resumed_event(self, monkeypatch):
+    tasks = [
+      TaskDefinition(id="task_a", name="A", description="", agent_id="planner", depends_on=[]),
+    ]
+    c = Crew(scenario="test", user_input="需求", tasks=tasks)
+    c.results["task_a"] = TaskResult(task_id="task_a", status=TaskStatus.FAILED, output="", error="boom")
+    c.status = "failed"
+    events: list[tuple[str, dict]] = []
+
+    async def capture(event_type, data):
+      events.append((event_type, data))
+
+    async def mock_execute(self, task_id, agent, prompt, task_context, feedback="", partial_output="", revision_base=""):
+      result = self.results.get(task_id) or TaskResult(task_id=task_id, status=TaskStatus.RUNNING)
+      result.output = "ok"
+      self.results[task_id] = result
+      return result.output
+
+    monkeypatch.setattr(Crew, "_execute_agent", mock_execute)
+    c._event_callback = capture
+
+    await c.retry_task("task_a")
+
+    assert any(e[0] == "crew_resumed" for e in events)
+    assert any(e[0] == "crew_completed" for e in events)
+
+
+class TestFinalizeCrewPartialSave:
+  """工作流失败时自动保存部分结果（防止白跑 token）"""
+
+  def _failed_crew(self) -> Crew:
+    c = Crew(scenario="experiment_design", user_input="测试研究需求", user_id="u1", tasks=[])
+    c.results["task_a"] = TaskResult(task_id="task_a", status=TaskStatus.COMPLETED, output="A-结果")
+    c.results["task_b"] = TaskResult(task_id="task_b", status=TaskStatus.FAILED, output="", error="boom")
+    c.status = "failed"
+    return c
+
+  @pytest.mark.asyncio
+  async def test_failure_saves_partial_results_once(self, monkeypatch):
+    from backend import main
+
+    calls: list[dict] = []
+
+    def fake_save(**kwargs):
+      calls.append(kwargs)
+      return "record-1"
+
+    monkeypatch.setattr(main.result_store, "save", fake_save)
+    crew = self._failed_crew()
+
+    await main._finalize_crew(crew)
+    await main._finalize_crew(crew)  # 重复调用不应重复保存
+
+    assert crew._saved_partial is True
+    assert len(calls) == 1
+    assert calls[0]["metadata"]["partial"] is True
+    assert calls[0]["metadata"]["status"] == "failed"
+    assert calls[0]["results"]["task_a"]["output"] == "A-结果"
+
+  @pytest.mark.asyncio
+  async def test_retry_completion_saves_final_after_partial(self, monkeypatch):
+    from backend import main
+
+    calls: list[dict] = []
+
+    def fake_save(**kwargs):
+      calls.append(kwargs)
+      return "record-1"
+
+    monkeypatch.setattr(main.result_store, "save", fake_save)
+    crew = self._failed_crew()
+
+    await main._finalize_crew(crew)
+    assert len(calls) == 1
+
+    # 重试成功后以完整结果保存
+    crew.status = "completed"
+    crew.results["task_b"].status = TaskStatus.COMPLETED
+    crew.results["task_b"].output = "B-结果"
+    await main._finalize_crew(crew)
+
+    assert crew._saved_complete is True
+    assert len(calls) == 2
+    assert "partial" not in calls[1]["metadata"]
+
+  @pytest.mark.asyncio
+  async def test_completed_crew_saves_normal(self, monkeypatch):
+    from backend import main
+
+    calls: list[dict] = []
+
+    def fake_save(**kwargs):
+      calls.append(kwargs)
+      return "record-1"
+
+    monkeypatch.setattr(main.result_store, "save", fake_save)
+    crew = Crew(scenario="experiment_design", user_input="测试研究需求", user_id="u1", tasks=[])
+    crew.results["task_a"] = TaskResult(task_id="task_a", status=TaskStatus.COMPLETED, output="A")
+    crew.status = "completed"
+
+    await main._finalize_crew(crew)
+
+    assert crew._saved_complete is True
+    assert len(calls) == 1
+    assert "partial" not in calls[0]["metadata"]

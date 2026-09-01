@@ -5,7 +5,7 @@ from typing import Any
 from sqlalchemy import select
 
 from backend.storage.database import get_session
-from backend.storage.models import LiteratureAnalysisRecord, LiteratureRecord, WorkspaceRecord
+from backend.storage.models import LiteratureAnalysisRecord, LiteratureIndexStatus, LiteratureRecord, WorkspaceRecord
 
 
 def _load_json(text: str, default: Any = None) -> Any:
@@ -15,7 +15,11 @@ def _load_json(text: str, default: Any = None) -> Any:
     return default if default is not None else []
 
 
-def _serialize_literature(lit: LiteratureRecord, analysis: LiteratureAnalysisRecord | None) -> dict:
+def _serialize_literature(
+  lit: LiteratureRecord,
+  analysis: LiteratureAnalysisRecord | None,
+  index_status: LiteratureIndexStatus | None = None,
+) -> dict:
   item = {
     "id": lit.id,
     "workspace_id": lit.workspace_id,
@@ -43,6 +47,22 @@ def _serialize_literature(lit: LiteratureRecord, analysis: LiteratureAnalysisRec
       "research_goal": analysis.research_goal,
       "methods_summary": analysis.methods_summary,
       "conclusion": analysis.conclusion,
+    }
+  if index_status:
+    item["index_status"] = {
+      "status": index_status.status,
+      "chunk_count": index_status.chunk_count,
+      "error_message": index_status.error_message,
+      "indexed_at": index_status.indexed_at.isoformat() if index_status.indexed_at else None,
+      "updated_at": index_status.updated_at.isoformat(),
+    }
+  else:
+    item["index_status"] = {
+      "status": "pending",
+      "chunk_count": 0,
+      "error_message": "",
+      "indexed_at": None,
+      "updated_at": None,
     }
   return item
 
@@ -72,7 +92,19 @@ def filter_literatures(
       .where(LiteratureRecord.workspace_id == workspace_id)
     )
     rows = session.execute(stmt).all()
-    results = [_serialize_literature(lit, analysis) for lit, analysis in rows]
+    lit_ids = [lit.id for lit, _ in rows]
+    status_map: dict[str, LiteratureIndexStatus] = {}
+    if lit_ids:
+      for st in session.scalars(
+        select(LiteratureIndexStatus).where(
+          LiteratureIndexStatus.literature_id.in_(lit_ids)
+        )
+      ).all():
+        status_map[st.literature_id] = st
+    results = [
+      _serialize_literature(lit, analysis, status_map.get(lit.id))
+      for lit, analysis in rows
+    ]
 
   if tags:
     tag_set = set(t.lower() for t in tags)

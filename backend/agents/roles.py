@@ -73,7 +73,7 @@ LITERATURE_RESEARCHER = AgentRole(
   ),
   goal="基于课题规划，检索并分析相关文献，输出文献综述报告，识别研究空白和创新点。"
     "若上下文包含用户文献库分析结果，须优先整合并标注引用来源。",
-  tools=["web_search", "file_parser"],
+  tools=["rag_search", "web_search", "file_parser"],
 )
 
 EXPERIMENT_DESIGNER = AgentRole(

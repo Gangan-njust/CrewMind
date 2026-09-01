@@ -4,9 +4,11 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from backend.auth import decode_token, get_current_user, get_user_by_id
+from backend.llm.client import set_llm_run_context
 from backend.literature.analyzer import analyze_batch, get_analysis_progress, identify_research_gaps
 from backend.literature.export import export_bibtex, export_endnote_xml, export_references
 from backend.literature.filter import filter_literatures, search_literatures
@@ -62,6 +64,8 @@ class AnalysisUpdateRequest(BaseModel):
   limitations: list[str] | None = None
   citation_templates: list[dict] | None = None
   formulas: list[dict] | None = None
+  results: dict | None = None
+  images: list[dict] | None = None
   research_background: str | None = None
   research_goal: str | None = None
   methods_summary: str | None = None
@@ -75,6 +79,24 @@ class ProposalFromLiteratureRequest(BaseModel):
   topic: str = Field(..., min_length=5)
   additional_requirements: str = ""
   selected_agents: list[str] = Field(default_factory=list, description="参与开题报告协作的 Agent 角色 ID")
+
+
+class RagSearchRequest(BaseModel):
+  query: str = Field(..., min_length=1, max_length=2000)
+  top_k: int | None = Field(None, ge=1, le=50)
+  literature_ids: list[str] | None = None
+  section_keys: list[str] | None = None
+  mode: str = Field("vector", pattern="^(vector|hybrid)$")
+
+
+class IndexLiteratureRequest(BaseModel):
+  force: bool = False
+
+
+class RagQueryRequest(BaseModel):
+  question: str = Field(..., min_length=1, max_length=2000)
+  literature_ids: list[str] | None = None
+  stream: bool = False
 
 
 class LiteratureConnectionManager:
@@ -217,6 +239,7 @@ async def analyze_literatures(
 
     await analyze_batch(ids, workspace_id, user_topic, on_progress=report_progress)
 
+  set_llm_run_context(user_id=current_user.id, run_id=workspace_id, source="literature")
   asyncio.create_task(run_analysis())
   return {"status": "started", "literature_ids": ids, "total": len(ids)}
 
@@ -241,6 +264,7 @@ async def get_research_gaps(
 ):
   try:
     literature_store._verify_workspace(workspace_id, current_user.id)
+    set_llm_run_context(user_id=current_user.id, run_id=workspace_id, source="literature")
     return await identify_research_gaps(workspace_id, topic)
   except ValueError as e:
     raise HTTPException(404, str(e))
@@ -391,6 +415,46 @@ async def delete_literature(
     raise HTTPException(404, str(e))
 
 
+@router.get("/workspaces/{workspace_id}/literatures/{literature_id}/images/{filename}")
+async def get_literature_image(
+  workspace_id: str,
+  literature_id: str,
+  filename: str,
+  token: str = Query(""),
+):
+  """返回从文献 PDF 中提取的图片文件。
+
+  通过 token 查询参数鉴权（而非 Authorization 头），使 <img> 标签可直接内联展示图片。
+  """
+  from backend.auth import decode_token, get_user_by_id
+
+  if not token:
+    raise HTTPException(401, "未登录")
+  try:
+    payload = decode_token(token)
+    user = get_user_by_id(payload.get("sub", ""))
+    if not user:
+      raise HTTPException(401, "用户不存在")
+  except HTTPException:
+    raise HTTPException(401, "登录已过期")
+
+  try:
+    literature_store._verify_workspace(workspace_id, user.id)
+  except ValueError as e:
+    raise HTTPException(404, str(e))
+
+  from backend.config import PROJECT_ROOT, settings
+  from backend.storage.literature_store import _safe_filename
+
+  safe_name = _safe_filename(filename)
+  image_path = (
+    PROJECT_ROOT / settings.literature_dir / workspace_id / literature_id / "images" / safe_name
+  ).resolve()
+  if not image_path.exists() or not image_path.is_file():
+    raise HTTPException(404, "图片不存在")
+  return FileResponse(str(image_path))
+
+
 @router.get("/workspaces/{workspace_id}/literatures/{literature_id}/analysis")
 async def get_literature_analysis(
   workspace_id: str,
@@ -415,6 +479,138 @@ async def update_literature_analysis(
     literature_store.get_literature(workspace_id, literature_id, current_user.id)
     updates = req.model_dump(exclude_none=True)
     return literature_store.update_analysis(literature_id, current_user.id, updates)
+  except ValueError as e:
+    raise HTTPException(400, str(e))
+
+
+# ── RAG 索引与检索 API ────────────────────────────────────────
+
+@router.post("/workspaces/{workspace_id}/literatures/{literature_id}/index")
+async def index_literature_api(
+  workspace_id: str,
+  literature_id: str,
+  req: IndexLiteratureRequest = IndexLiteratureRequest(),
+  current_user: User = Depends(get_current_user),
+):
+  try:
+    literature_store.get_literature(workspace_id, literature_id, current_user.id)
+  except ValueError as e:
+    raise HTTPException(404, str(e))
+
+  from backend.rag.indexer import index_literature_async
+
+  async def run_index():
+    try:
+      await index_literature_async(literature_id, force=req.force)
+    except Exception as e:
+      logger.exception("手动索引失败: %s", literature_id)
+
+  asyncio.create_task(run_index())
+  return {"status": "started", "literature_id": literature_id}
+
+
+@router.get("/workspaces/{workspace_id}/literatures/{literature_id}/index-status")
+async def get_index_status_api(
+  workspace_id: str,
+  literature_id: str,
+  current_user: User = Depends(get_current_user),
+):
+  try:
+    literature_store.get_literature(workspace_id, literature_id, current_user.id)
+  except ValueError as e:
+    raise HTTPException(404, str(e))
+
+  from backend.rag.indexer import get_index_status
+
+  status = get_index_status(literature_id)
+  return status or {
+    "literature_id": literature_id,
+    "workspace_id": workspace_id,
+    "status": "pending",
+    "chunk_count": 0,
+    "error_message": "",
+  }
+
+
+@router.post("/workspaces/{workspace_id}/rag/search")
+async def rag_search_api(
+  workspace_id: str,
+  req: RagSearchRequest,
+  current_user: User = Depends(get_current_user),
+):
+  try:
+    literature_store._verify_workspace(workspace_id, current_user.id)
+  except ValueError as e:
+    raise HTTPException(404, str(e))
+
+  from backend.config import settings as app_settings
+  if not app_settings.rag_enabled:
+    raise HTTPException(400, "RAG 功能未启用")
+
+  from backend.rag.retriever import search
+
+  hits = search(
+    workspace_id,
+    req.query,
+    mode=req.mode,
+    top_k=req.top_k,
+    literature_ids=req.literature_ids,
+    section_keys=req.section_keys,
+  )
+  return {"query": req.query, "count": len(hits), "results": hits}
+
+
+@router.get("/workspaces/{workspace_id}/rag/stats")
+async def rag_stats_api(
+  workspace_id: str,
+  current_user: User = Depends(get_current_user),
+):
+  try:
+    literature_store._verify_workspace(workspace_id, current_user.id)
+  except ValueError as e:
+    raise HTTPException(404, str(e))
+
+  from backend.rag.indexer import get_workspace_stats
+
+  return get_workspace_stats(workspace_id)
+
+
+@router.post("/workspaces/{workspace_id}/rag/query")
+async def rag_query_api(
+  workspace_id: str,
+  req: RagQueryRequest,
+  current_user: User = Depends(get_current_user),
+):
+  try:
+    literature_store._verify_workspace(workspace_id, current_user.id)
+  except ValueError as e:
+    raise HTTPException(404, str(e))
+
+  from backend.config import settings as app_settings
+  if not app_settings.rag_enabled:
+    raise HTTPException(400, "RAG 功能未启用")
+
+  from backend.rag.query import answer_query, stream_query
+
+  set_llm_run_context(user_id=current_user.id, run_id=workspace_id, source="literature")
+
+  if req.stream:
+    return StreamingResponse(
+      stream_query(
+        workspace_id,
+        req.question,
+        literature_ids=req.literature_ids,
+      ),
+      media_type="text/event-stream",
+      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+  try:
+    return await answer_query(
+      workspace_id,
+      req.question,
+      literature_ids=req.literature_ids,
+    )
   except ValueError as e:
     raise HTTPException(400, str(e))
 
@@ -483,10 +679,12 @@ def register_proposal_route(app, workflow_manager, ws_manager, attach_callback, 
         user_input=user_input,
         user_id=current_user.id,
         selected_agents=req.selected_agents,
+        workspace_id=req.workspace_id,
       )
     except ValueError as e:
       raise HTTPException(400, str(e))
     attach_callback(crew)
+    set_llm_run_context(user_id=current_user.id, run_id=crew.id, source="workflow")
 
     async def run_crew():
       try:
@@ -529,6 +727,7 @@ def register_literature_websocket(app):
       await websocket.close(code=4004, reason="工作空间不存在")
       return
 
+    set_llm_run_context(user_id=user.id, run_id=workspace_id, source="literature")
     await literature_ws_manager.connect(workspace_id, websocket)
     try:
       await websocket.send_json({

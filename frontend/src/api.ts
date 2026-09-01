@@ -92,6 +92,7 @@ export interface HistoryRecord {
   user_input: string
   created_at: string
   task_count: number
+  partial?: boolean
 }
 
 export interface TopicRecord {
@@ -113,6 +114,7 @@ export interface VersionRecord {
   scenario: string
   created_at: string
   task_count: number
+  partial?: boolean
   is_best: boolean
 }
 
@@ -277,6 +279,19 @@ export async function fetchAgents(): Promise<Agent[]> {
 export async function fetchAvailableTools(): Promise<ToolOption[]> {
   const res = await authFetch(`${API_BASE}/tools`)
   if (!res.ok) throw new Error(await parseError(res, '加载工具失败'))
+  return res.json()
+}
+
+export async function extractAgentFromPrompt(prompt: string): Promise<Partial<AgentFormData>> {
+  const res = await authFetch(`${API_BASE}/agents/extract`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt }),
+  })
+  if (res.status === 405) {
+    throw new Error('后端未启用角色提取接口，请重启 py run.py 后重试')
+  }
+  if (!res.ok) throw new Error(await parseError(res, '角色信息提取失败'))
   return res.json()
 }
 
@@ -468,6 +483,16 @@ export async function resumeWorkflow(crewId: string) {
   return res.json()
 }
 
+export async function retryTask(crewId: string, taskId: string) {
+  const res = await authFetch(`${API_BASE}/workflow/${crewId}/retry`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ task_id: taskId }),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '重试失败'))
+  return res.json()
+}
+
 export async function fetchTemplates(): Promise<TemplateListResponse> {
   const res = await authFetch(`${API_BASE}/templates`)
   if (!res.ok) throw new Error(await parseError(res, '加载模板失败'))
@@ -538,6 +563,23 @@ export interface LiteratureFormula {
   context?: string
 }
 
+export interface LiteratureResults {
+  article_summary?: string
+  results_summary?: string
+  result_items?: string[]
+  important_figures?: string[]
+}
+
+export interface LiteratureImage {
+  filename: string
+  page: number
+  width?: number | null
+  height?: number | null
+  section?: string
+  caption?: string
+  context?: string
+}
+
 export interface LiteratureAnalysis {
   id?: string
   tags: string[]
@@ -548,6 +590,8 @@ export interface LiteratureAnalysis {
   limitations: string[]
   citation_templates: { zh?: string; en?: string }[]
   formulas?: LiteratureFormula[]
+  results?: LiteratureResults
+  images?: LiteratureImage[]
   research_background: string
   research_goal: string
   methods_summary: string
@@ -566,6 +610,24 @@ export interface Literature {
   status: 'pending' | 'processing' | 'done' | 'failed'
   uploaded_at: string
   analysis?: LiteratureAnalysis
+  index_status?: LiteratureIndexStatus
+}
+
+export interface LiteratureIndexStatus {
+  status: 'pending' | 'indexing' | 'done' | 'failed'
+  chunk_count: number
+  error_message: string
+  indexed_at: string | null
+  updated_at: string | null
+}
+
+export interface RagSource {
+  literature_id: string
+  literature_title: string
+  chunk_id: string
+  section_key: string
+  excerpt: string
+  score?: number
 }
 
 export interface AnalysisProgress {
@@ -727,6 +789,116 @@ export async function exportLiteratureCitations(
   return data.content
 }
 
+export async function getLiteratureIndexStatus(
+  workspaceId: string,
+  literatureId: string,
+): Promise<LiteratureIndexStatus & { literature_id?: string }> {
+  const res = await authFetch(
+    `${API_BASE}/workspaces/${workspaceId}/literatures/${literatureId}/index-status`,
+  )
+  if (!res.ok) throw new Error(await parseError(res, '获取索引状态失败'))
+  return res.json()
+}
+
+export async function reindexLiterature(
+  workspaceId: string,
+  literatureId: string,
+  force = false,
+): Promise<{ status: string; literature_id: string }> {
+  const res = await authFetch(
+    `${API_BASE}/workspaces/${workspaceId}/literatures/${literatureId}/index`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force }),
+    },
+  )
+  if (!res.ok) throw new Error(await parseError(res, '触发索引失败'))
+  return res.json()
+}
+
+export function literatureImageUrl(
+  workspaceId: string,
+  literatureId: string,
+  filename: string,
+): string {
+  const base = `${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/literatures/${encodeURIComponent(literatureId)}/images/${encodeURIComponent(filename)}`
+  const token = getToken()
+  if (!token) return base
+  return `${base}?token=${encodeURIComponent(token)}`
+}
+
+function parseSseBlock(block: string): { event: string; data: string } | null {
+  let event = 'message'
+  let data = ''
+  for (const line of block.split('\n')) {
+    if (line.startsWith('event:')) event = line.slice(6).trim()
+    else if (line.startsWith('data:')) data += line.slice(5).trim()
+  }
+  return data ? { event, data } : null
+}
+
+export async function ragQuery(
+  workspaceId: string,
+  data: {
+    question: string
+    literature_ids?: string[]
+    stream?: boolean
+    onToken?: (token: string) => void
+    onSources?: (sources: RagSource[]) => void
+  },
+): Promise<{ answer: string; sources: RagSource[]; question: string }> {
+  const res = await authFetch(`${API_BASE}/workspaces/${workspaceId}/rag/query`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      question: data.question,
+      literature_ids: data.literature_ids,
+      stream: !!data.stream,
+    }),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '文献问答失败'))
+
+  if (!data.stream) {
+    return res.json()
+  }
+
+  const reader = res.body?.getReader()
+  if (!reader) throw new Error('流式响应不可用')
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let answer = ''
+  let sources: RagSource[] = []
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const parts = buffer.split('\n\n')
+    buffer = parts.pop() || ''
+    for (const part of parts) {
+      const parsed = parseSseBlock(part.trim())
+      if (!parsed) continue
+      const payload = JSON.parse(parsed.data)
+      if (parsed.event === 'sources') {
+        sources = payload.sources || []
+        data.onSources?.(sources)
+      } else if (parsed.event === 'token') {
+        answer += payload.content || ''
+        data.onToken?.(payload.content || '')
+      } else if (parsed.event === 'done') {
+        answer = payload.answer || answer
+        sources = payload.sources || sources
+      } else if (parsed.event === 'error') {
+        throw new Error(payload.message || '文献问答失败')
+      }
+    }
+  }
+
+  return { question: data.question, answer, sources }
+}
+
 export async function startProposalFromLiterature(data: {
   workspace_id: string
   literature_ids: string[]
@@ -813,6 +985,8 @@ export interface WritingProject {
   source_workflow_id: string | null
   workspace_id: string | null
   outline: OutlineSection[]
+  keywords_zh: string[]
+  keywords_en: string[]
   citation_format: CitationFormat
   created_at: string
   updated_at: string
@@ -858,7 +1032,7 @@ export interface SectionVersion {
 }
 
 const SECTION_LABELS: Record<string, string> = {
-  abstract: '摘要', abstract_en: 'Abstract', intro: '引言', methods: '方法', results: '结果',
+  abstract: '摘要', abstract_en: 'Abstract', intro: '绪论', methods: '方法', results: '结果',
   discussion: '讨论', conclusion: '结论', related_work: '相关工作', acknowledgments: '致谢',
 }
 
@@ -906,7 +1080,8 @@ export async function createWritingProject(data: {
 
 export async function updateWritingProject(id: string, data: Partial<{
   title: string; topic: string; paper_type: PaperType
-  target_journal: string; workspace_id: string; outline: OutlineSection[]
+  target_journal: string; workspace_id: string | null; outline: OutlineSection[]
+  keywords_zh: string[]; keywords_en: string[]
   citation_format: CitationFormat
 }>): Promise<WritingProject> {
   const res = await authFetch(`${API_BASE}/writing/projects/${id}`, {
@@ -1003,7 +1178,8 @@ export async function expandWriting(data: {
   mode?: 'free' | 'structured'
   global_requirements?: string
   items?: ExpandSubsectionItem[]
-}): Promise<{ expanded_text: string; original_text: string; mode?: string }> {
+  project_id?: string
+}): Promise<{ expanded_text: string; original_text: string; mode?: string; rag_evidence_count?: number }> {
   const res = await authFetch(`${API_BASE}/writing/expand`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1065,7 +1241,8 @@ export async function polishWriting(data: {
   mode?: 'free' | 'structured'
   global_requirements?: string
   items?: ExpandSubsectionItem[]
-}): Promise<{ polished_text: string; changes_summary: string[]; mode?: string }> {
+  project_id?: string
+}): Promise<{ polished_text: string; changes_summary: string[]; mode?: string; rag_evidence_count?: number }> {
   const res = await authFetch(`${API_BASE}/writing/polish`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1120,9 +1297,47 @@ export async function checkBlankLines(text: string): Promise<{
   return res.json()
 }
 
+export async function generateWritingKeywords(projectId: string): Promise<{
+  keywords_zh: string[]
+  abstract_body: string
+  summary: string
+  project: WritingProject
+}> {
+  const res = await authFetch(`${API_BASE}/writing/check/keywords/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId }),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '关键词生成失败'))
+  return res.json()
+}
+
+export async function checkAbstractKeywords(projectId: string) {
+  const res = await authFetch(`${API_BASE}/writing/check/abstract-keywords`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId }),
+  })
+  if (!res.ok) throw new Error(await parseError(res, 'Abstract 检查失败'))
+  return res.json()
+}
+
 export async function recommendCitations(data: {
   selected_text: string; context?: string; project_id: string
-}) {
+}): Promise<{
+  recommendations: Array<{
+    literature_id: string
+    chunk_id?: string
+    excerpt?: string
+    section_key?: string
+    relevance_score?: number
+    reason?: string
+    literature?: { title?: string; authors?: string[]; year?: number }
+  }>
+  message?: string
+  rag_used?: boolean
+  fallback?: boolean
+}> {
   const res = await authFetch(`${API_BASE}/writing/citations/recommend`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1139,6 +1354,30 @@ export async function generateCitationSentences(literatureId: string, purpose?: 
     body: JSON.stringify({ literature_id: literatureId, purpose }),
   })
   if (!res.ok) throw new Error(await parseError(res, '引用句式生成失败'))
+  return res.json()
+}
+
+export async function applyWritingCitation(data: {
+  project_id: string
+  section_id: string
+  literature_id: string
+  selected_text?: string
+  purpose?: string
+}): Promise<{
+  index: number
+  citation_marker: string
+  insert_text: string
+  sentences: { style: string; style_label: string; text: string }[]
+  is_new_reference: boolean
+  bibliography: { index: number; literature_id: string; formatted: string }[]
+  project: WritingProject
+}> {
+  const res = await authFetch(`${API_BASE}/writing/citations/apply`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '应用引用失败'))
   return res.json()
 }
 
@@ -1293,15 +1532,49 @@ export interface ExperimentAnalysis {
   created_at: string
 }
 
+export interface ExperimentMetric {
+  id: string
+  experiment_id: string
+  metric_name: string
+  step: number
+  value: number
+  unit: string
+  created_at: string
+}
+
+export interface ExperimentFile {
+  id: string
+  experiment_id: string
+  filename: string
+  file_type: 'model' | 'log' | 'script' | 'other'
+  file_size: number
+  version: number
+  meta: Record<string, unknown>
+  created_at: string
+  url: string
+}
+
+export interface ExperimentStep {
+  id: string
+  name: string
+  status?: string
+}
+
 export interface ExperimentSummary {
   id: string
   title: string
   description: string
   source_workflow_id: string | null
   expected_metrics: ExpectedMetric[]
+  config: Record<string, unknown>
   status: string
+  progress: number
+  current_step: string
+  steps: ExperimentStep[]
   entry_count: number
   dataset_count: number
+  metric_count: number
+  file_count: number
   created_at: string
   updated_at: string
 }
@@ -1309,6 +1582,8 @@ export interface ExperimentSummary {
 export interface Experiment extends ExperimentSummary {
   entries: ExperimentEntry[]
   datasets: ExperimentDataset[]
+  metrics: ExperimentMetric[]
+  files: ExperimentFile[]
 }
 
 export interface ComparisonItem {
@@ -1330,6 +1605,48 @@ export interface ComparisonResult {
   expected_metrics?: ExpectedMetric[]
   comparisons: ComparisonItem[]
   summary: string
+}
+
+export interface MetricChartResult {
+  type: string
+  title: string
+  image_base64: string
+  empty?: boolean
+}
+
+export interface MultiCompareExperiment {
+  experiment_id: string
+  title: string
+  status: string
+  status_label: string
+  progress: number
+  entry_count: number
+  dataset_count: number
+  metric_count: number
+  file_count: number
+  config: Record<string, unknown>
+  metric_summaries: Record<string, Record<string, number>>
+}
+
+export interface MultiCompareResult {
+  experiments: MultiCompareExperiment[]
+  metric_names: string[]
+  charts: MetricChartResult[]
+  summary: string
+}
+
+export interface ReproduceFileItem {
+  filename: string
+  size: number
+}
+
+export interface ReproduceResult {
+  experiment_id: string
+  generated_at: string
+  manifest: Record<string, unknown>
+  files: ReproduceFileItem[]
+  entrypoint: string
+  download_url: string
 }
 
 export async function fetchExperiments(): Promise<ExperimentSummary[]> {
@@ -1361,7 +1678,16 @@ export async function createExperiment(data: {
 
 export async function updateExperiment(
   id: string,
-  data: Partial<{ title: string; description: string; status: string; expected_metrics: ExpectedMetric[] }>,
+  data: Partial<{
+    title: string
+    description: string
+    status: string
+    expected_metrics: ExpectedMetric[]
+    config: Record<string, unknown>
+    progress: number
+    current_step: string
+    steps: ExperimentStep[]
+  }>,
 ): Promise<Experiment> {
   const res = await authFetch(`${API_BASE}/experiment/experiments/${id}`, {
     method: 'PATCH',
@@ -1498,3 +1824,211 @@ export async function fetchWorkflowExpectedMetrics(workflowId: string) {
   if (!res.ok) throw new Error(await parseError(res, '获取方案预期指标失败'))
   return res.json()
 }
+
+// ── 实验增强：配置 / 指标 / 文件 / 多实验对比 / 一键复现 ─────────────
+
+export async function updateExperimentConfig(
+  experimentId: string,
+  config: Record<string, unknown>,
+): Promise<Experiment> {
+  const res = await authFetch(`${API_BASE}/experiment/experiments/${experimentId}/config`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ config }),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '保存实验配置失败'))
+  return res.json()
+}
+
+export async function recordExperimentMetrics(
+  experimentId: string,
+  items: { metric_name: string; step: number; value: number; unit?: string }[],
+): Promise<ExperimentMetric[]> {
+  const res = await authFetch(`${API_BASE}/experiment/experiments/${experimentId}/metrics`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items }),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '记录训练指标失败'))
+  return res.json()
+}
+
+export async function fetchExperimentMetrics(
+  experimentId: string,
+  metricName?: string,
+): Promise<{ experiment_id: string; metric_names: string[]; metrics: ExperimentMetric[] }> {
+  const params = metricName ? `?metric_name=${encodeURIComponent(metricName)}` : ''
+  const res = await authFetch(`${API_BASE}/experiment/experiments/${experimentId}/metrics${params}`)
+  if (!res.ok) throw new Error(await parseError(res, '获取训练指标失败'))
+  return res.json()
+}
+
+export async function fetchMetricChart(experimentId: string, metricName: string): Promise<MetricChartResult> {
+  const res = await authFetch(
+    `${API_BASE}/experiment/experiments/${experimentId}/metrics/chart?metric_name=${encodeURIComponent(metricName)}`,
+  )
+  if (!res.ok) throw new Error(await parseError(res, '生成指标曲线失败'))
+  return res.json()
+}
+
+export async function uploadExperimentFile(
+  experimentId: string,
+  file: File,
+  fileType: 'model' | 'log' | 'script' | 'other',
+): Promise<ExperimentFile> {
+  const form = new FormData()
+  form.append('file', file)
+  const res = await authFetch(
+    `${API_BASE}/experiment/experiments/${experimentId}/files?file_type=${fileType}`,
+    { method: 'POST', body: form },
+  )
+  if (!res.ok) throw new Error(await parseError(res, '上传实验文件失败'))
+  return res.json()
+}
+
+export async function fetchExperimentFiles(experimentId: string): Promise<ExperimentFile[]> {
+  const res = await authFetch(`${API_BASE}/experiment/experiments/${experimentId}/files`)
+  if (!res.ok) throw new Error(await parseError(res, '获取实验文件失败'))
+  return res.json()
+}
+
+export async function deleteExperimentFile(fileId: string): Promise<void> {
+  const res = await authFetch(`${API_BASE}/experiment/files/${fileId}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(await parseError(res, '删除实验文件失败'))
+}
+
+export async function compareExperimentsMulti(
+  experimentIds: string[],
+  metricNames?: string[],
+): Promise<MultiCompareResult> {
+  const res = await authFetch(`${API_BASE}/experiment/experiments/compare-multi`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ experiment_ids: experimentIds, metric_names: metricNames }),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '多实验对比失败'))
+  return res.json()
+}
+
+export async function generateReproducePackage(
+  experimentId: string,
+  entrypoint?: string,
+): Promise<ReproduceResult> {
+  const res = await authFetch(`${API_BASE}/experiment/experiments/${experimentId}/reproduce`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entrypoint: entrypoint || '' }),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '生成复现包失败'))
+  return res.json()
+}
+
+// ── 工具箱：运行记录 / 调用日志 / API 配置 ──────────────────────
+
+export interface UsageRun {
+  run_id: string
+  source: string
+  scenario?: string | null
+  title?: string | null
+  call_count: number
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  duration_ms: number
+  first_at: string | null
+  last_at: string | null
+}
+
+export interface UsageCall {
+  id: string
+  run_id: string | null
+  source: string
+  model: string
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  duration_ms: number
+  created_at: string
+}
+
+export interface UsageSummary {
+  call_count: number
+  total_tokens: number
+  prompt_tokens: number
+  completion_tokens: number
+  duration_ms: number
+}
+
+export interface ApiConfig {
+  has_api_key: boolean
+  base_url: string
+  model: string
+  updated_at: string | null
+  using_system_key: boolean
+}
+
+export async function fetchUsageSummary(): Promise<UsageSummary> {
+  const res = await authFetch(`${API_BASE}/toolbox/summary`)
+  if (!res.ok) throw new Error(await parseError(res, '获取用量统计失败'))
+  return res.json()
+}
+
+export async function fetchUsageRuns(source?: string): Promise<UsageRun[]> {
+  const q = source ? `?source=${encodeURIComponent(source)}` : ''
+  const res = await authFetch(`${API_BASE}/toolbox/runs${q}`)
+  if (!res.ok) throw new Error(await parseError(res, '获取运行记录失败'))
+  return res.json()
+}
+
+export async function fetchUsageRunDetail(runId: string): Promise<{ run_id: string; calls: UsageCall[] }> {
+  const res = await authFetch(`${API_BASE}/toolbox/runs/${encodeURIComponent(runId)}`)
+  if (!res.ok) throw new Error(await parseError(res, '获取运行详情失败'))
+  return res.json()
+}
+
+export async function fetchUsageLogs(): Promise<UsageCall[]> {
+  const res = await authFetch(`${API_BASE}/toolbox/logs`)
+  if (!res.ok) throw new Error(await parseError(res, '获取调用日志失败'))
+  return res.json()
+}
+
+export async function fetchApiConfig(): Promise<ApiConfig> {
+  const res = await authFetch(`${API_BASE}/toolbox/api-config`)
+  if (!res.ok) throw new Error(await parseError(res, '获取 API 配置失败'))
+  return res.json()
+}
+
+export async function saveApiConfig(data: {
+  api_key?: string
+  base_url?: string
+  model?: string
+}): Promise<ApiConfig> {
+  const res = await authFetch(`${API_BASE}/toolbox/api-config`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '保存 API 配置失败'))
+  return res.json()
+}
+
+export async function clearApiConfig(): Promise<{ status: string; using_system_key: boolean }> {
+  const res = await authFetch(`${API_BASE}/toolbox/api-config`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(await parseError(res, '清除 API 配置失败'))
+  return res.json()
+}
+
+export async function testApiConfig(data: {
+  api_key?: string
+  base_url?: string
+  model?: string
+}): Promise<{ ok: boolean; message: string; model?: string; reply?: string }> {
+  const res = await authFetch(`${API_BASE}/toolbox/api-config/test`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) throw new Error(await parseError(res, 'API 连通性测试失败'))
+  return res.json()
+}
+

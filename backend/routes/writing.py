@@ -19,6 +19,12 @@ from backend.writing.assistant import (
   polish_text,
   rule_based_style_check,
 )
+from backend.writing.abstract_keywords import (
+  check_abstract_and_keywords,
+  compose_abstract_content,
+  generate_keywords_from_abstract,
+  split_abstract_content,
+)
 from backend.writing.export import (
   build_docx,
   build_markdown,
@@ -26,6 +32,7 @@ from backend.writing.export import (
   get_bibliography_for_project,
 )
 from backend.writing.citations import (
+  apply_citation,
   check_citation_completeness,
   format_all_references,
   generate_citation_sentences,
@@ -56,6 +63,8 @@ class ProjectUpdateRequest(BaseModel):
   target_journal: str | None = Field(None, max_length=256)
   workspace_id: str | None = None
   outline: list | None = None
+  keywords_zh: list[str] | None = None
+  keywords_en: list[str] | None = None
   citation_format: str | None = Field(None, pattern="^(gb7714|apa|mla|chicago)$")
 
 
@@ -110,6 +119,7 @@ class ExpandRequest(BaseModel):
   mode: str = Field("free", pattern="^(free|structured)$")
   global_requirements: str = Field("", max_length=2000)
   items: list[ExpandSubsectionItem] | None = None
+  project_id: str | None = None
 
 
 class CompleteOutlineRequest(BaseModel):
@@ -126,6 +136,7 @@ class PolishRequest(BaseModel):
   mode: str = Field("free", pattern="^(free|structured)$")
   global_requirements: str = Field("", max_length=2000)
   items: list[ExpandSubsectionItem] | None = None
+  project_id: str | None = None
 
 
 class TermReplaceRequest(BaseModel):
@@ -147,7 +158,7 @@ class BlankLinesCheckRequest(BaseModel):
 
 
 class CitationRecommendRequest(BaseModel):
-  selected_text: str = Field(..., min_length=5)
+  selected_text: str = Field(..., min_length=1)
   context: str = ""
   project_id: str
 
@@ -159,6 +170,14 @@ class CitationSentenceRequest(BaseModel):
 
 class CitationCompletenessRequest(BaseModel):
   project_id: str
+
+
+class CitationApplyRequest(BaseModel):
+  project_id: str
+  section_id: str
+  literature_id: str
+  selected_text: str = ""
+  purpose: str = ""
 
 
 class ReferenceAddRequest(BaseModel):
@@ -249,6 +268,8 @@ async def update_project(
       target_journal=req.target_journal,
       workspace_id=req.workspace_id,
       outline=req.outline,
+      keywords_zh=req.keywords_zh,
+      keywords_en=req.keywords_en,
       citation_format=req.citation_format,
     )
   except ValueError as e:
@@ -379,6 +400,10 @@ async def expand_writing_api(req: ExpandRequest, current_user: User = Depends(ge
   if req.mode == "structured" and not req.items:
     raise HTTPException(400, "目录扩写需要至少一个小节配置")
   try:
+    workspace_id = None
+    if req.project_id:
+      project, _ = _get_project_topic(req.project_id, current_user.id)
+      workspace_id = project.get("workspace_id")
     return await expand_writing(
       req.text,
       section_type=req.section_type,
@@ -387,6 +412,7 @@ async def expand_writing_api(req: ExpandRequest, current_user: User = Depends(ge
       mode=req.mode,
       global_requirements=req.global_requirements,
       items=[item.model_dump() for item in req.items] if req.items else None,
+      workspace_id=workspace_id,
     )
   except ValueError as e:
     raise HTTPException(400, str(e))
@@ -404,10 +430,6 @@ async def continue_writing_api(req: ContinueRequest, current_user: User = Depend
       topic="",
       length=req.length,
     )
-  except ValueError as e:
-    raise HTTPException(400, str(e))
-
-
   except ValueError as e:
     raise HTTPException(400, str(e))
 
@@ -461,6 +483,10 @@ async def polish_text_api(req: PolishRequest, current_user: User = Depends(get_c
   if req.mode == "structured" and not req.items:
     raise HTTPException(400, "小节润色需要至少一个小节配置")
   try:
+    workspace_id = None
+    if req.project_id:
+      project, _ = _get_project_topic(req.project_id, current_user.id)
+      workspace_id = project.get("workspace_id")
     return await polish_text(
       req.text,
       section_type=req.section_type,
@@ -469,6 +495,7 @@ async def polish_text_api(req: PolishRequest, current_user: User = Depends(get_c
       mode=req.mode,
       global_requirements=req.global_requirements,
       items=[item.model_dump() for item in req.items] if req.items else None,
+      workspace_id=workspace_id,
     )
   except ValueError as e:
     raise HTTPException(400, str(e))
@@ -529,6 +556,60 @@ async def check_blank_lines_api(
   return clean_blank_lines(req.text)
 
 
+@router.post("/check/keywords/generate")
+async def generate_keywords_api(
+  req: CoherenceCheckRequest,
+  current_user: User = Depends(get_current_user),
+):
+  try:
+    project, _ = _get_project_topic(req.project_id, current_user.id)
+    abstract_zh = ""
+    for sec in project["sections"]:
+      if sec.get("section_type") == "abstract":
+        abstract_zh = sec.get("content") or ""
+        break
+    result = await generate_keywords_from_abstract(abstract_zh, project.get("topic", ""))
+    keywords_zh = result["keywords_zh"]
+    writing_store.update_project(
+      req.project_id,
+      current_user.id,
+      keywords_zh=keywords_zh,
+    )
+    abstract_body = result["abstract_body"]
+    abstract_sec = next((s for s in project["sections"] if s.get("section_type") == "abstract"), None)
+    if abstract_sec:
+      composed = compose_abstract_content(abstract_body, keywords_zh, english=False)
+      writing_store.update_section(
+        abstract_sec["id"],
+        current_user.id,
+        composed,
+        save_version=True,
+        version_note="更新中文关键词",
+      )
+    updated = writing_store.get_project(req.project_id, current_user.id)
+    return {
+      "keywords_zh": keywords_zh,
+      "abstract_body": abstract_body,
+      "summary": f"已从摘要生成 {len(keywords_zh)} 个中文关键词",
+      "project": updated,
+    }
+  except ValueError as e:
+    raise HTTPException(400, str(e))
+
+
+@router.post("/check/abstract-keywords")
+async def check_abstract_keywords_api(
+  req: CoherenceCheckRequest,
+  current_user: User = Depends(get_current_user),
+):
+  try:
+    project, _ = _get_project_topic(req.project_id, current_user.id)
+    result = await check_abstract_and_keywords(project)
+    return {**result, "type": "abstract_keywords"}
+  except ValueError as e:
+    raise HTTPException(400, str(e))
+
+
 # ── 引用功能 ──────────────────────────────────────────────────
 
 @router.post("/citations/recommend")
@@ -554,6 +635,25 @@ async def citation_sentences_api(
 ):
   try:
     return await generate_citation_sentences(req.literature_id, req.purpose)
+  except ValueError as e:
+    raise HTTPException(400, str(e))
+
+
+@router.post("/citations/apply")
+async def apply_citation_api(
+  req: CitationApplyRequest,
+  current_user: User = Depends(get_current_user),
+):
+  try:
+    writing_store.get_project(req.project_id, current_user.id)
+    return await apply_citation(
+      req.project_id,
+      current_user.id,
+      req.section_id,
+      req.literature_id,
+      req.selected_text,
+      req.purpose,
+    )
   except ValueError as e:
     raise HTTPException(400, str(e))
 

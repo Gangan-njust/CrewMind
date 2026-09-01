@@ -1,13 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import {
   PenLine, Plus, Trash2, Loader, ChevronLeft, Sparkles, Wand2,
   CheckCircle, BookMarked, History, GitCompare, Save, FileText,
   List, Eye, Copy, RotateCcw, BookOpen, FlaskConical, BarChart3,
   MessageSquare, Library, Heart, X, Clock, Check, AlertCircle,
   ChevronDown, ChevronUp, ChevronRight, GraduationCap, Presentation, Newspaper, Sparkle,
-  Download, Maximize2, Pencil, ArrowUp, ArrowDown, FolderPlus, Heading2,
+  Download, Maximize2, Pencil, ArrowUp, ArrowDown, FolderPlus, Heading2, Link2, Hash,
 } from 'lucide-react'
 import {
   fetchWritingProjects, fetchWritingProject, createWritingProject,
@@ -15,7 +13,8 @@ import {
   generateWritingOutline, expandWriting, polishWriting,
   completeWritingFromOutline,
   checkTerminology, checkCoherence, checkStyle, checkBlankLines,
-  recommendCitations, checkCitationCompleteness, fetchSectionVersions,
+  generateWritingKeywords, checkAbstractKeywords,
+  recommendCitations, applyWritingCitation, checkCitationCompleteness, fetchSectionVersions,
   compareSectionVersions, rollbackSection, fetchWritingBibliography,
   createWritingFromWorkflow, fetchWorkspaces, fillMethodsFromWorkflow,
   downloadWritingExport, createWritingSection, updateWritingSectionMeta,
@@ -23,9 +22,12 @@ import {
   getSectionDisplayName, getSectionLabel, isAbstractSection,
   type WritingProject, type WritingProjectSummary,
   type WritingSection, type SectionVersion, type PaperType, type CitationFormat,
-  type OutlineSubsection,
+  type OutlineSubsection, type Workspace,
 } from '../api'
 import { buildFullDocumentMarkdown } from '../writingPreview'
+import { WritingMarkdownPreview } from '../WritingMarkdownPreview'
+import { BIBLIOGRAPHY_SECTION_TITLE, insertCitationAtPosition, isBibliographySection } from '../writingCitations'
+import { computeSectionNumbers, getNumberedSectionDisplayName } from '../writingSectionNumbers'
 import {
   buildExpandStructureItems,
   getExpandPreamble,
@@ -123,12 +125,44 @@ function formatRelativeTime(iso: string): string {
   return new Date(iso).toLocaleDateString('zh-CN')
 }
 
-interface Props {
-  workflowRecordId?: string | null
-  onProjectReady?: () => void
+function formatKeywordsInput(keywords: string[] | undefined, english = false): string {
+  if (!keywords?.length) return ''
+  return english ? keywords.join('; ') : keywords.join('；')
 }
 
-export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
+function parseKeywordsInput(text: string): string[] {
+  return text.split(/[;；,，、]/).map(s => s.trim()).filter(Boolean)
+}
+
+function composeAbstractWithKeywords(body: string, keywords: string[], english: boolean): string {
+  if (!keywords.length) return body.trim()
+  const label = english ? 'Keywords' : '关键词'
+  const sep = english ? '; ' : '；'
+  const suffix = english ? `${label}: ${keywords.join(sep)}` : `${label}：${keywords.join(sep)}`
+  const trimmed = body.trim()
+  return trimmed ? `${trimmed}\n\n${suffix}` : suffix
+}
+
+function stripKeywordsFromAbstract(content: string, english: boolean): string {
+  const pattern = english
+    ? /^\s*Keywords[：:]\s*.+$/im
+    : /^\s*关键词[：:]\s*.+$/im
+  return content.replace(pattern, '').trim()
+}
+
+interface Props {
+  workflowRecordId?: string | null
+  workspaceLink?: { id: string; name: string } | null
+  onProjectReady?: () => void
+  onWorkspaceLinkReady?: () => void
+}
+
+export function WritingAssistant({
+  workflowRecordId,
+  workspaceLink,
+  onProjectReady,
+  onWorkspaceLinkReady,
+}: Props) {
   const [projects, setProjects] = useState<WritingProjectSummary[]>([])
   const [activeProject, setActiveProject] = useState<WritingProject | null>(null)
   const [activeSection, setActiveSection] = useState<WritingSection | null>(null)
@@ -147,6 +181,7 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
   const [outlineExpanded, setOutlineExpanded] = useState(true)
   const [createForm, setCreateForm] = useState({
     title: '', topic: '', paper_type: 'journal' as PaperType, target_journal: '',
+    workspace_id: '',
   })
   const [versions, setVersions] = useState<SectionVersion[]>([])
   const [compareResult, setCompareResult] = useState<any>(null)
@@ -173,7 +208,10 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
   const [polishMode, setPolishMode] = useState<PolishMode>('free')
   const [polishStructureItems, setPolishStructureItems] = useState<ExpandStructureItem[]>([])
   const [polishGlobalRequirements, setPolishGlobalRequirements] = useState('')
-  const [workspaces, setWorkspaces] = useState<{ id: string; name: string }[]>([])
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([])
+  const [applyingCitationId, setApplyingCitationId] = useState<string | null>(null)
+  const [keywordsZhInput, setKeywordsZhInput] = useState('')
+  const [keywordsEnInput, setKeywordsEnInput] = useState('')
   const autoSaveTimer = useRef<ReturnType<typeof setInterval>>()
   const lastSaved = useRef('')
   const toastTimer = useRef<ReturnType<typeof setTimeout>>()
@@ -230,8 +268,32 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
     return () => document.removeEventListener('click', close)
   }, [showExportMenu])
   useEffect(() => {
-    fetchWorkspaces().then(ws => setWorkspaces(ws.map(w => ({ id: w.id, name: w.name })))).catch(() => {})
+    fetchWorkspaces().then(setWorkspaces).catch(() => {})
   }, [])
+
+  const getWorkspaceName = useCallback((id: string | null | undefined) => {
+    if (!id) return ''
+    return workspaces.find(w => w.id === id)?.name || '文献工作空间'
+  }, [workspaces])
+
+  useEffect(() => {
+    if (!activeProject) return
+    setKeywordsZhInput(formatKeywordsInput(activeProject.keywords_zh ?? []))
+    setKeywordsEnInput(formatKeywordsInput(activeProject.keywords_en ?? [], true))
+  }, [activeProject?.id, activeProject?.keywords_zh, activeProject?.keywords_en])
+
+  useEffect(() => {
+    if (!workspaceLink) return
+    setActiveProject(null)
+    setActiveSection(null)
+    setCreateForm(f => ({
+      ...f,
+      title: workspaceLink.name,
+      workspace_id: workspaceLink.id,
+    }))
+    setShowCreate(true)
+    onWorkspaceLinkReady?.()
+  }, [workspaceLink]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!workflowRecordId) return
@@ -332,7 +394,10 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
     setCreating(true)
     setError('')
     try {
-      const project = await createWritingProject(createForm)
+      const project = await createWritingProject({
+        ...createForm,
+        workspace_id: createForm.workspace_id || undefined,
+      })
       if (createForm.topic.trim()) {
         const outline = await generateWritingOutline({
           topic: createForm.topic,
@@ -342,7 +407,7 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
         await updateWritingProject(project.id, { outline: outline.sections })
       }
       setShowCreate(false)
-      setCreateForm({ title: '', topic: '', paper_type: 'journal', target_journal: '' })
+      setCreateForm({ title: '', topic: '', paper_type: 'journal', target_journal: '', workspace_id: '' })
       await loadProjects()
       await openProject(project.id)
       showToastMsg('写作项目已创建')
@@ -385,9 +450,13 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
         topic: activeProject?.topic || '',
         length: expandLength,
         mode: 'free',
+        project_id: activeProject?.id,
       })
       setToolResult(result)
-      showToastMsg('扩写完成，可预览后应用')
+      const ragHint = result.rag_evidence_count
+        ? `已注入 ${result.rag_evidence_count} 条文献证据`
+        : '扩写完成，可预览后应用'
+      showToastMsg(ragHint)
     } catch (e: any) {
       setError(e.message)
     } finally {
@@ -427,6 +496,7 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
         topic: activeProject?.topic || '',
         mode: 'structured',
         global_requirements: expandGlobalRequirements,
+        project_id: activeProject?.id,
         items: enabledItems.map(item => ({
           title: item.title,
           level: item.level,
@@ -438,7 +508,10 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
         })),
       })
       setToolResult(result)
-      showToastMsg('目录扩写完成，可预览后应用')
+      const ragHint = result.rag_evidence_count
+        ? `已注入 ${result.rag_evidence_count} 条文献证据`
+        : '目录扩写完成，可预览后应用'
+      showToastMsg(ragHint)
     } catch (e: any) {
       setError(e.message)
     } finally {
@@ -506,9 +579,13 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
         topic: activeProject?.topic || '',
         style: polishStyle,
         mode: 'free',
+        project_id: activeProject?.id,
       })
       setToolResult(result)
-      showToastMsg('润色完成，可预览后应用')
+      const ragHint = result.rag_evidence_count
+        ? `已注入 ${result.rag_evidence_count} 条文献证据`
+        : '润色完成，可预览后应用'
+      showToastMsg(ragHint)
     } catch (e: any) {
       setError(e.message)
     } finally {
@@ -549,6 +626,7 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
         style: polishStyle,
         mode: 'structured',
         global_requirements: polishGlobalRequirements,
+        project_id: activeProject?.id,
         items: enabledItems.map(item => ({
           title: item.title,
           level: item.level,
@@ -560,7 +638,10 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
         })),
       })
       setToolResult(result)
-      showToastMsg('小节润色完成，可预览后应用')
+      const ragHint = result.rag_evidence_count
+        ? `已注入 ${result.rag_evidence_count} 条文献证据`
+        : '小节润色完成，可预览后应用'
+      showToastMsg(ragHint)
     } catch (e: any) {
       setError(e.message)
     } finally {
@@ -572,7 +653,7 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
     setPolishStructureItems(prev => prev.map(item => item.id === id ? { ...item, ...patch } : item))
   }, [])
 
-  const runCheck = async (type: 'terminology' | 'coherence' | 'style' | 'citation' | 'blank_lines') => {
+  const runCheck = async (type: 'terminology' | 'coherence' | 'style' | 'citation' | 'blank_lines' | 'keywords_generate' | 'abstract_keywords') => {
     if (type !== 'blank_lines' && !activeProject) return
     if (type === 'blank_lines' && !editContent.trim()) {
       showToastMsg('当前章节暂无内容')
@@ -586,8 +667,131 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
       else if (type === 'coherence') result = await checkCoherence(activeProject!.id)
       else if (type === 'style') result = await checkStyle(editContent, activeSection?.section_type)
       else if (type === 'blank_lines') result = await checkBlankLines(editContent)
-      else result = await checkCitationCompleteness(activeProject!.id)
-      setToolResult({ type, ...result })
+      else if (type === 'keywords_generate') {
+        result = await generateWritingKeywords(activeProject!.id)
+        setActiveProject(result.project)
+        setKeywordsZhInput(formatKeywordsInput(result.keywords_zh))
+        const abstractSec = result.project.sections.find(s => s.section_type === 'abstract')
+        if (abstractSec && activeSection?.id === abstractSec.id) {
+          setEditContent(abstractSec.content)
+          lastSaved.current = abstractSec.content
+          setActiveSection(abstractSec)
+        }
+        result = { type: 'keywords_generate', ...result }
+      } else if (type === 'abstract_keywords') {
+        result = await checkAbstractKeywords(activeProject!.id)
+        result = { type: 'abstract_keywords', ...result }
+      } else result = await checkCitationCompleteness(activeProject!.id)
+      if (!result.type) setToolResult({ type, ...result })
+      else setToolResult(result)
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setToolLoading(false)
+    }
+  }
+
+  const saveKeywords = async () => {
+    if (!activeProject) return
+    const keywords_zh = parseKeywordsInput(keywordsZhInput)
+    const keywords_en = parseKeywordsInput(keywordsEnInput)
+    setToolLoading(true)
+    try {
+      let project = await updateWritingProject(activeProject.id, { keywords_zh, keywords_en })
+
+      const abstractSec = project.sections.find(s => s.section_type === 'abstract')
+      if (abstractSec) {
+        const body = stripKeywordsFromAbstract(abstractSec.content, false)
+        const content = composeAbstractWithKeywords(body, keywords_zh, false)
+        const updated = await updateWritingSection(abstractSec.id, {
+          content,
+          save_version: true,
+          version_note: '更新中文关键词',
+        })
+        project = {
+          ...project,
+          sections: project.sections.map(s => s.id === abstractSec.id ? updated : s),
+        }
+        if (activeSection?.id === abstractSec.id) {
+          setEditContent(content)
+          lastSaved.current = content
+          setActiveSection(updated)
+        }
+      }
+
+      const abstractEnSec = project.sections.find(s => s.section_type === 'abstract_en')
+      if (abstractEnSec) {
+        const body = stripKeywordsFromAbstract(abstractEnSec.content, true)
+        const content = composeAbstractWithKeywords(body, keywords_en, true)
+        const updated = await updateWritingSection(abstractEnSec.id, {
+          content,
+          save_version: true,
+          version_note: '更新英文 Keywords',
+        })
+        project = {
+          ...project,
+          sections: project.sections.map(s => s.id === abstractEnSec.id ? updated : s),
+        }
+        if (activeSection?.id === abstractEnSec.id) {
+          setEditContent(content)
+          lastSaved.current = content
+          setActiveSection(updated)
+        }
+      }
+
+      setActiveProject(project)
+      showToastMsg('关键词已保存')
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setToolLoading(false)
+    }
+  }
+
+  const applyAbstractKeywordsFix = async () => {
+    if (!activeProject || (!toolResult?.abstract_en_suggested && !toolResult?.keywords_en_suggested?.length)) return
+    setToolLoading(true)
+    try {
+      let project = activeProject
+      const keywords_en = toolResult.keywords_en_suggested?.length
+        ? toolResult.keywords_en_suggested
+        : (project.keywords_en || parseKeywordsInput(keywordsEnInput))
+
+      if (toolResult.abstract_en_suggested) {
+        const enSec = project.sections.find(s => s.section_type === 'abstract_en')
+        if (enSec) {
+          const content = composeAbstractWithKeywords(toolResult.abstract_en_suggested, keywords_en, true)
+          const updated = await updateWritingSection(enSec.id, {
+            content,
+            save_version: true,
+            version_note: 'Abstract 自动翻译',
+          })
+          project = {
+            ...project,
+            sections: project.sections.map(s => s.id === enSec.id ? updated : s),
+          }
+          if (activeSection?.id === enSec.id) {
+            setEditContent(content)
+            lastSaved.current = content
+            setActiveSection(updated)
+          }
+        }
+      }
+
+      if (toolResult.keywords_en_suggested?.length) {
+        project = await updateWritingProject(project.id, { keywords_en: toolResult.keywords_en_suggested })
+        setKeywordsEnInput(formatKeywordsInput(toolResult.keywords_en_suggested, true))
+      }
+
+      setActiveProject(project)
+      setToolResult((prev: any) => prev ? {
+        ...prev,
+        abstract_en_ok: true,
+        keywords_en_ok: true,
+        needs_fix: false,
+        summary: '已应用 Abstract 与 Keywords 修正',
+      } : prev)
+      showToastMsg('已应用 Abstract / Keywords 修正')
     } catch (e: any) {
       setError(e.message)
     } finally {
@@ -597,20 +801,78 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
 
   const runCitationRecommend = async () => {
     if (!activeProject) return
-    const selected = window.getSelection()?.toString() || editContent.slice(-100)
+    const ta = textareaRef.current
+    const selected = ta
+      ? editContent.slice(ta.selectionStart, ta.selectionEnd)
+      : (window.getSelection()?.toString() || editContent.slice(-100))
+    if (selected.trim().length < 5 && !editContent.trim()) {
+      showToastMsg('请先选中要引用的文字，或输入章节内容')
+      return
+    }
     setToolLoading(true)
     setToolResult(null)
     try {
       const result = await recommendCitations({
-        selected_text: selected,
+        selected_text: selected.trim() || editContent.slice(-100),
         context: editContent,
         project_id: activeProject.id,
       })
-      setToolResult(result)
+      setToolResult({ type: 'recommend', ...result })
     } catch (e: any) {
       setError(e.message)
     } finally {
       setToolLoading(false)
+    }
+  }
+
+  const applyCitation = async (rec: {
+    literature_id: string
+    reason?: string
+    literature?: { title?: string }
+  }) => {
+    if (!activeProject || !activeSection || isBibliographySection(activeSection)) {
+      showToastMsg('请在正文章节中应用引用')
+      return
+    }
+    const ta = textareaRef.current
+    const start = ta?.selectionStart ?? editContent.length
+    const end = ta?.selectionEnd ?? editContent.length
+    const selected = editContent.slice(start, end)
+
+    setApplyingCitationId(rec.literature_id)
+    setError('')
+    try {
+      const result = await applyWritingCitation({
+        project_id: activeProject.id,
+        section_id: activeSection.id,
+        literature_id: rec.literature_id,
+        selected_text: selected,
+        purpose: selected || rec.reason || '',
+      })
+
+      const newContent = insertCitationAtPosition(editContent, start, end, result.insert_text)
+      setEditContent(newContent)
+      lastSaved.current = newContent
+
+      const updated = await updateWritingSection(activeSection.id, {
+        content: newContent,
+        save_version: true,
+        version_note: `插入引用 ${result.citation_marker}`,
+      })
+      setActiveSection(updated)
+      setActiveProject(result.project)
+
+      setToolResult({
+        type: 'recommend',
+        recommendations: toolResult?.recommendations,
+        bibliography: result.bibliography,
+        lastApplied: result,
+      })
+      showToastMsg(`已插入引用 ${result.citation_marker}，参考文献已更新`)
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setApplyingCitationId(null)
     }
   }
 
@@ -766,6 +1028,19 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
     setToolResult(bib)
   }
 
+  const handleWorkspaceLink = async (workspaceId: string) => {
+    if (!activeProject) return
+    try {
+      const updated = await updateWritingProject(activeProject.id, {
+        workspace_id: workspaceId || null,
+      })
+      setActiveProject(updated)
+      showToastMsg(workspaceId ? '已关联文献工作空间' : '已取消文献工作空间关联')
+    } catch (e: any) {
+      setError(e.message)
+    }
+  }
+
   const handleBackToList = () => {
     if (hasUnsaved && !confirm('有未保存的更改，确定返回？')) return
     setActiveProject(null)
@@ -824,7 +1099,7 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
 
   const handleDeleteSection = async (section: WritingSection) => {
     if (!section.is_custom) return
-    if (!confirm(`确定删除章节「${getSectionDisplayName(section)}」？内容将不可恢复。`)) return
+    if (!confirm(`确定删除章节「${sectionTitle(section)}」？内容将不可恢复。`)) return
     setSectionManagerLoading(true)
     try {
       await deleteWritingSection(section.id)
@@ -874,6 +1149,17 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
   )
   const completedSections = activeProject?.sections.filter(s => sectionStatus(s.word_count) === 'done').length ?? 0
   const outlineItem = activeProject?.outline?.find(o => o.section_type === activeSection?.section_type)
+  const activeIsBibliography = activeSection ? isBibliographySection(activeSection) : false
+
+  const sectionNumbers = useMemo(
+    () => computeSectionNumbers(activeProject?.sections ?? []),
+    [activeProject?.sections],
+  )
+
+  const sectionTitle = useCallback(
+    (section: WritingSection) => getNumberedSectionDisplayName(section, sectionNumbers),
+    [sectionNumbers],
+  )
 
   if (!activeProject) {
     return (
@@ -986,7 +1272,7 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
                   </div>
                 </div>
 
-                <div className="form-group" style={{ marginBottom: 0 }}>
+                <div className="form-group">
                   <label className="form-label" htmlFor="writing-journal">
                     目标期刊 / 会议
                     <span className="form-label-hint">可选</span>
@@ -1000,6 +1286,29 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
                     disabled={creating}
                   />
                 </div>
+
+                {workspaces.length > 0 && (
+                  <div className="form-group" style={{ marginBottom: 0 }}>
+                    <label className="form-label" htmlFor="writing-workspace">
+                      关联文献工作空间
+                      <span className="form-label-hint">可选 · 用于引用推荐</span>
+                    </label>
+                    <select
+                      id="writing-workspace"
+                      className="form-input"
+                      value={createForm.workspace_id}
+                      onChange={e => setCreateForm(f => ({ ...f, workspace_id: e.target.value }))}
+                      disabled={creating}
+                    >
+                      <option value="">不关联</option>
+                      {workspaces.map(w => (
+                        <option key={w.id} value={w.id}>
+                          {w.name}（{w.literature_count} 篇文献）
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
 
                 {creating && (
                   <div className="writing-create-loading">
@@ -1084,6 +1393,11 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
                 <p className="writing-card-topic">{p.topic || '未设置研究主题'}</p>
                 <div className="writing-card-footer">
                   <span><Clock size={12} /> {formatRelativeTime(p.updated_at)}</span>
+                  {p.workspace_id && (
+                    <span className="writing-card-workspace" title="已关联文献工作空间">
+                      <Link2 size={12} /> {getWorkspaceName(p.workspace_id)}
+                    </span>
+                  )}
                   {p.target_journal && <span className="writing-card-journal">{p.target_journal}</span>}
                 </div>
               </article>
@@ -1110,6 +1424,25 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
             </span>
             <span>{totalWords} 字</span>
             <span>{completedSections}/{activeProject.sections.length} 章节已完成</span>
+            {activeProject.workspace_id ? (
+              <span className="writing-workspace-badge linked" title="已关联文献工作空间">
+                <Link2 size={12} />
+                {getWorkspaceName(activeProject.workspace_id)}
+              </span>
+            ) : workspaces.length > 0 && (
+              <select
+                className="writing-workspace-inline-select"
+                value=""
+                onChange={e => { if (e.target.value) handleWorkspaceLink(e.target.value) }}
+                title="关联文献工作空间"
+                aria-label="关联文献工作空间"
+              >
+                <option value="">关联文献库…</option>
+                {workspaces.map(w => (
+                  <option key={w.id} value={w.id}>{w.name}</option>
+                ))}
+              </select>
+            )}
           </div>
         </div>
         <div className="writing-header-actions">
@@ -1230,6 +1563,7 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
                   <SectionTreeNode
                     key={sec.id}
                     section={sec}
+                    displayName={sectionTitle(sec)}
                     outlineSubsections={outlineForSection?.subsections}
                     isActive={activeSection?.id === sec.id}
                     isExpanded={expandedSections.has(sec.id)}
@@ -1300,7 +1634,7 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
             <div className="writing-editor-toolbar">
               <div className="toolbar-left">
                 <span className="writing-section-name">
-                  {activeSection ? getSectionDisplayName(activeSection) : ''}
+                  {activeSection ? sectionTitle(activeSection) : ''}
                 </span>
                 {activeSection && (
                   <span className="writing-toolbar-stat">v{activeSection.version}</span>
@@ -1334,25 +1668,32 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
               </div>
             </div>
             <div className="writing-editor-split">
+              {activeIsBibliography && (
+                <div className="writing-bibliography-banner">
+                  <BookMarked size={14} />
+                  <span>「{BIBLIOGRAPHY_SECTION_TITLE}」章节由引用自动维护，应用引用后将自动更新</span>
+                </div>
+              )}
               {!showPreview ? (
                 <textarea
                   ref={textareaRef}
                   className="writing-textarea"
                   value={editContent}
                   onChange={e => setEditContent(e.target.value)}
+                  readOnly={activeIsBibliography}
                   placeholder={
-                    activeSection?.section_type === 'abstract'
+                    activeIsBibliography
+                      ? '参考文献将在应用引用后自动生成…'
+                      : activeSection?.section_type === 'abstract'
                       ? '在此撰写中文摘要，约300字，连贯段落，不要使用标题…\n\nCtrl+S 快速保存'
                       : activeSection?.section_type === 'abstract_en'
                         ? 'Write the English Abstract here (~250-300 words, continuous paragraphs, no headings)…\n\nCtrl+S to save'
-                        : `在此撰写${activeSection ? getSectionDisplayName(activeSection) : ''}…\n\n支持 Markdown；可用工具栏插入二/三/四级小节标题（##、###、####），Ctrl+S 快速保存`
+                        : `在此撰写${activeSection ? sectionTitle(activeSection) : ''}…\n\n支持 Markdown；可用工具栏插入二/三/四级小节标题（##、###、####），Ctrl+S 快速保存`
                   }
                 />
               ) : (
                 <div className="writing-preview markdown-body">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {editContent || '*暂无内容，返回编辑模式后可输入正文*'}
-                  </ReactMarkdown>
+                  <WritingMarkdownPreview content={editContent || '*暂无内容，返回编辑模式后可输入正文*'} />
                 </div>
               )}
             </div>
@@ -1655,12 +1996,56 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
               {toolTab === 'check' && (
                 <div className={`writing-tool-section ${toolLoading ? 'dimmed' : ''}`}>
                   <p className="writing-tool-desc">多维度检查论文质量</p>
+
+                  <div className="writing-keywords-panel">
+                    <h5><Hash size={14} /> 关键词设置</h5>
+                    <label className="writing-field compact">
+                      <span>中文关键词（3–5 个，分号分隔）</span>
+                      <input
+                        className="form-input"
+                        value={keywordsZhInput}
+                        onChange={e => setKeywordsZhInput(e.target.value)}
+                        placeholder="深度学习；医学图像；语义分割"
+                        disabled={toolLoading}
+                      />
+                    </label>
+                    <label className="writing-field compact">
+                      <span>英文 Keywords</span>
+                      <input
+                        className="form-input"
+                        value={keywordsEnInput}
+                        onChange={e => setKeywordsEnInput(e.target.value)}
+                        placeholder="deep learning; medical imaging; semantic segmentation"
+                        disabled={toolLoading}
+                      />
+                    </label>
+                    <div className="writing-keywords-actions">
+                      <button
+                        type="button"
+                        className="btn btn-outline btn-sm"
+                        onClick={() => runCheck('keywords_generate')}
+                        disabled={toolLoading}
+                      >
+                        <Sparkles size={12} /> 从摘要生成
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-outline btn-sm"
+                        onClick={saveKeywords}
+                        disabled={toolLoading}
+                      >
+                        <Save size={12} /> 保存关键词
+                      </button>
+                    </div>
+                  </div>
+
                   <div className="writing-check-grid">
                     {([
                       ['terminology', '术语一致'],
                       ['coherence', '逻辑连贯'],
                       ['style', '表达规范'],
                       ['citation', '引用完整'],
+                      ['abstract_keywords', 'Abstract 检查'],
                       ['blank_lines', '去除空行'],
                     ] as const).map(([k, label]) => (
                       <button key={k} type="button" className="btn btn-outline" onClick={() => runCheck(k)} disabled={toolLoading}>
@@ -1683,6 +2068,55 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
                               }}
                             >
                               应用整理结果
+                            </button>
+                          )}
+                        </>
+                      ) : toolResult.type === 'keywords_generate' ? (
+                        <>
+                          <p className="writing-result-summary">{toolResult.summary}</p>
+                          <div className="writing-keywords-result">
+                            {toolResult.keywords_zh?.map((kw: string, i: number) => (
+                              <span key={i} className="writing-keyword-chip">{kw}</span>
+                            ))}
+                          </div>
+                        </>
+                      ) : toolResult.type === 'abstract_keywords' ? (
+                        <>
+                          <p className="writing-result-summary">{toolResult.summary}</p>
+                          <div className="writing-abstract-check-status">
+                            <span className={toolResult.abstract_en_ok ? 'ok' : 'warn'}>
+                              Abstract {toolResult.abstract_en_ok ? '✓ 英文' : '✗ 需修正'}
+                            </span>
+                            <span className={toolResult.keywords_en_ok ? 'ok' : 'warn'}>
+                              Keywords {toolResult.keywords_en_ok ? '✓ 英文' : '✗ 需修正'}
+                            </span>
+                          </div>
+                          {toolResult.abstract_en_suggested && (
+                            <div className="writing-check-card severity-low">
+                              <strong>建议 Abstract</strong>
+                              <p className="writing-suggested-text">{toolResult.abstract_en_suggested.slice(0, 280)}{toolResult.abstract_en_suggested.length > 280 ? '…' : ''}</p>
+                            </div>
+                          )}
+                          {toolResult.keywords_en_suggested?.length > 0 && (
+                            <div className="writing-check-card severity-low">
+                              <strong>建议 Keywords</strong>
+                              <p>{toolResult.keywords_en_suggested.join('; ')}</p>
+                            </div>
+                          )}
+                          {(toolResult.issues || []).map((item: any, i: number) => (
+                            <div key={i} className={`writing-check-card severity-${item.severity || 'medium'}`}>
+                              <strong>{item.description}</strong>
+                              <p>{item.suggestion}</p>
+                            </div>
+                          ))}
+                          {toolResult.needs_fix && (
+                            <button
+                              type="button"
+                              className="btn btn-primary writing-tool-action"
+                              onClick={applyAbstractKeywordsFix}
+                              disabled={toolLoading}
+                            >
+                              应用 Abstract / Keywords 修正
                             </button>
                           )}
                         </>
@@ -1710,8 +2144,29 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
 
               {toolTab === 'citation' && (
                 <div className={`writing-tool-section ${toolLoading ? 'dimmed' : ''}`}>
-                  <p className="writing-tool-desc">选中文字后推荐文献，或切换引用格式</p>
-                  <button type="button" className="btn btn-primary writing-tool-action" onClick={runCitationRecommend} disabled={toolLoading}>
+                  <p className="writing-tool-desc">选中正文后推荐文献，点击「应用引用」插入上标编号；参考文献将自动追加为最后一章</p>
+                  {workspaces.length > 0 && (
+                    <label className="writing-field compact">
+                      <span>文献工作空间</span>
+                      <select
+                        value={activeProject.workspace_id || ''}
+                        onChange={e => handleWorkspaceLink(e.target.value)}
+                      >
+                        <option value="">未关联</option>
+                        {workspaces.map(w => (
+                          <option key={w.id} value={w.id}>
+                            {w.name}（{w.literature_count} 篇）
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                  {!activeProject.workspace_id && (
+                    <p className="writing-muted writing-workspace-hint">
+                      请先关联文献助手中的工作空间，以启用智能引用推荐
+                    </p>
+                  )}
+                  <button type="button" className="btn btn-primary writing-tool-action" onClick={runCitationRecommend} disabled={toolLoading || !activeProject.workspace_id}>
                     <BookMarked size={14} /> 推荐引用
                   </button>
                   <label className="writing-field compact">
@@ -1725,41 +2180,56 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
                       ))}
                     </select>
                   </label>
-                  {!activeProject.workspace_id && workspaces.length > 0 && (
-                    <label className="writing-field compact">
-                      <span>关联文献库</span>
-                      <select
-                        value={activeProject.workspace_id || ''}
-                        onChange={e => updateWritingProject(activeProject.id, { workspace_id: e.target.value }).then(setActiveProject)}
-                      >
-                        <option value="">选择工作空间</option>
-                        {workspaces.map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
-                      </select>
-                    </label>
-                  )}
                   {toolResult?.recommendations?.map((rec: any, i: number) => (
                     <div key={i} className="writing-citation-card fade-in">
                       <div className="citation-score">{Math.round((rec.relevance_score || 0) * 100)}%</div>
-                      <div>
+                      <div className="writing-citation-card-body">
                         <strong>{rec.literature?.title || rec.literature_id}</strong>
                         <p>{rec.reason}</p>
+                        {rec.excerpt && (
+                          <blockquote className="writing-citation-excerpt">{rec.excerpt}</blockquote>
+                        )}
+                        {rec.literature?.authors?.length > 0 && (
+                          <p className="writing-citation-authors">
+                            {rec.literature.authors.slice(0, 3).join(', ')}
+                            {rec.literature.year ? ` (${rec.literature.year})` : ''}
+                          </p>
+                        )}
+                        <button
+                          type="button"
+                          className="btn btn-primary btn-sm writing-citation-apply"
+                          disabled={!!applyingCitationId || activeIsBibliography}
+                          onClick={() => applyCitation(rec)}
+                        >
+                          {applyingCitationId === rec.literature_id ? (
+                            <><Loader size={12} className="spinner" /> 插入中…</>
+                          ) : (
+                            <><BookMarked size={12} /> 应用引用</>
+                          )}
+                        </button>
                       </div>
                     </div>
                   ))}
-                  {toolResult?.references?.map((ref: any) => (
-                    <div key={ref.index} className="writing-bib-item fade-in">
-                      <span className="bib-index">[{ref.index}]</span>
-                      <span className="bib-text">{ref.formatted}</span>
-                      <button
-                        type="button"
-                        className="btn-icon"
-                        title="复制引用"
-                        onClick={() => { navigator.clipboard.writeText(ref.formatted); showToastMsg('已复制') }}
-                      >
-                        <Copy size={12} />
-                      </button>
+                  {toolResult?.lastApplied && (
+                    <div className="writing-citation-applied fade-in">
+                      <Check size={14} />
+                      <span>
+                        已插入 {toolResult.lastApplied.citation_marker}
+                        {toolResult.lastApplied.is_new_reference ? '（新增参考文献）' : '（复用已有编号）'}
+                      </span>
                     </div>
-                  ))}
+                  )}
+                  {(toolResult?.bibliography?.length > 0 || toolResult?.references?.length > 0) && (
+                    <div className="writing-bibliography-preview">
+                      <h5><Library size={14} /> 参考文献</h5>
+                      {(toolResult.bibliography || toolResult.references).map((ref: any) => (
+                        <div key={ref.index ?? ref.literature_id} className="writing-bib-item fade-in">
+                          <span className="bib-index">[{ref.index}]</span>
+                          <span className="bib-text">{ref.formatted}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -1852,7 +2322,7 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
                     const willSkip = completeSkipFilled && sec.word_count >= 80 && sec.content.trim()
                     return (
                       <li key={sec.id} className={willSkip ? 'skipped' : ''}>
-                        <strong>{getSectionDisplayName(sec)}</strong>
+                        <strong>{sectionTitle(sec)}</strong>
                         {subCount > 0 && <span> · {subCount} 个子节/要点</span>}
                         {willSkip && <span className="tag">跳过</span>}
                       </li>
@@ -1911,7 +2381,7 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
             <div className="modal-header">
               <div>
                 <h3>整体预览</h3>
-                <p className="writing-full-preview-subtitle">{activeProject.title}</p>
+                <p className="writing-full-preview-subtitle">{activeProject.title} · 含自动生成的目录</p>
               </div>
               <button
                 type="button"
@@ -1923,13 +2393,11 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
               </button>
             </div>
             <div className="writing-full-preview-body markdown-body">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {fullPreviewMarkdown}
-              </ReactMarkdown>
+              <WritingMarkdownPreview content={fullPreviewMarkdown} />
             </div>
             <div className="writing-full-preview-footer">
               <span className="writing-full-preview-hint">
-                {hasUnsaved ? '含当前章节未保存的编辑内容' : '按章节顺序合并预览'}
+                {hasUnsaved ? '含当前章节未保存的编辑内容' : '按章节顺序合并预览，目录根据章节与子标题自动生成'}
               </span>
               <button type="button" className="btn btn-primary" onClick={() => setShowFullPreview(false)}>
                 关闭
@@ -1962,6 +2430,7 @@ export function WritingAssistant({ workflowRecordId, onProjectReady }: Props) {
                 <SectionManagerRow
                   key={sec.id}
                   section={sec}
+                  displayName={sectionTitle(sec)}
                   isFirst={idx === 0}
                   isLast={idx === activeProject.sections.length - 1}
                   disabled={sectionManagerLoading}
@@ -2077,6 +2546,7 @@ function SectionRewriteItemEditor({
 
 function SectionTreeNode({
   section,
+  displayName,
   outlineSubsections,
   isActive,
   isExpanded,
@@ -2089,6 +2559,7 @@ function SectionTreeNode({
   onInsertHeading,
 }: {
   section: WritingSection
+  displayName: string
   outlineSubsections?: OutlineSubsection[]
   isActive: boolean
   isExpanded: boolean
@@ -2126,13 +2597,16 @@ function SectionTreeNode({
           onClick={onSelect}
         >
           <Icon size={14} className="section-icon" />
-          <span className="section-label">{getSectionDisplayName(section)}</span>
+          <span className="section-label">{displayName}</span>
+          {isBibliographySection(section) && (
+            <span className="section-auto-badge" title="自动维护">自动</span>
+          )}
           <span className="section-words">{section.word_count || '—'}</span>
         </button>
       </div>
 
       {isExpanded && (
-        <div className="writing-section-tree-children" role="group" aria-label={`${getSectionDisplayName(section)} 子标题`}>
+        <div className="writing-section-tree-children" role="group" aria-label={`${displayName} 子标题`}>
           {headings.map((heading, i) => {
             const key = `${section.id}:${heading.line}`
             return (
@@ -2199,6 +2673,7 @@ function SectionTreeNode({
 
 function SectionManagerRow({
   section,
+  displayName,
   isFirst,
   isLast,
   disabled,
@@ -2207,6 +2682,7 @@ function SectionManagerRow({
   onMove,
 }: {
   section: WritingSection
+  displayName: string
   isFirst: boolean
   isLast: boolean
   disabled: boolean
@@ -2252,7 +2728,7 @@ function SectionManagerRow({
           />
         ) : (
           <button type="button" className="row-title-btn" onClick={() => setEditing(true)} disabled={disabled}>
-            <span>{getSectionDisplayName(section)}</span>
+            <span>{displayName}</span>
             {section.is_custom && <span className="custom-tag">自定义</span>}
             {!section.is_custom && section.title && <span className="renamed-tag">已重命名</span>}
             <Pencil size={12} />

@@ -28,6 +28,8 @@ def setup_database() -> None:
   from backend.storage.models import (  # noqa: F401
     CustomAgentRecord,
     LiteratureAnalysisRecord,
+    LiteratureChunkRecord,
+    LiteratureIndexStatus,
     LiteratureRecord,
     TopicRecord,
     User,

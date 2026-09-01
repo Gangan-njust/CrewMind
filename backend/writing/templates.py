@@ -3,7 +3,7 @@
 SECTION_LABELS = {
   "abstract": "摘要",
   "abstract_en": "Abstract",
-  "intro": "引言",
+  "intro": "绪论",
   "methods": "方法",
   "results": "结果",
   "discussion": "讨论",

@@ -1,4 +1,5 @@
 """步骤4-6：Agent 实例、Task 执行与 Crew 编排"""
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -6,6 +7,7 @@ from datetime import datetime
 from typing import Any, Callable, Awaitable
 
 from backend.agents.roles import AgentRole
+from backend.config import settings
 from backend.llm.client import DeepSeekClient
 from backend.tasks.definitions import TaskDefinition, TaskStatus
 from backend.tools.registry import run_agent_tools
@@ -47,6 +49,7 @@ class Agent:
     revision_base: str = "",
     user_input: str = "",
     reference_files: list[str] | None = None,
+    workspace_id: str | None = None,
     on_chunk: Callable[[str], Awaitable[None]] | None = None,
     on_tool_event: Callable[[str, str, str], Awaitable[None]] | None = None,
   ) -> str:
@@ -67,6 +70,7 @@ class Agent:
       reference_files or [],
       partial_output,
       on_tool_event=on_tool_event,
+      workspace_id=workspace_id,
     )
     messages.extend(tool_messages)
 
@@ -117,6 +121,7 @@ class Crew:
   user_id: str = ""
   topic_id: str | None = None
   reference_files: list[str] = field(default_factory=list)
+  workspace_id: str | None = None
   tasks: list[TaskDefinition] = field(default_factory=list)
   agent_registry: dict[str, AgentRole] = field(default_factory=dict)
   results: dict[str, TaskResult] = field(default_factory=dict)
@@ -126,6 +131,8 @@ class Crew:
   _human_feedback_queue: dict[str, str] = field(default_factory=dict, repr=False)
   _user_pause_requested: bool = field(default=False, repr=False)
   _suspended_task_id: str | None = field(default=None, repr=False)
+  _saved_complete: bool = field(default=False, repr=False)
+  _saved_partial: bool = field(default=False, repr=False)
   _debate_history: list[dict[str, Any]] = field(default_factory=list, repr=False)
   _debate_round: int = field(default=0, repr=False)
   _debate_phase: str = field(default="init", repr=False)
@@ -186,6 +193,7 @@ class Crew:
       revision_base=revision_base,
       user_input=self.user_input,
       reference_files=self.reference_files,
+      workspace_id=self.workspace_id,
       on_chunk=on_chunk,
       on_tool_event=on_tool_event,
     )
@@ -198,6 +206,8 @@ class Crew:
     self._user_pause_requested = True
 
   async def _handle_suspend(self, task_id: str) -> None:
+    if self.status == "suspended":
+      return
     self._user_pause_requested = False
     self.status = "suspended"
     self._suspended_task_id = task_id
@@ -248,6 +258,55 @@ class Crew:
 
     return await self._execute_from_index(start_idx)
 
+  def _collect_downstream(self, task_id: str) -> list[str]:
+    """收集指定任务及其所有传递下游任务（用于失败重试时重置）"""
+    ids = {task_id}
+    changed = True
+    while changed:
+      changed = False
+      for t in self.tasks:
+        if t.id not in ids and any(dep in ids for dep in t.depends_on):
+          ids.add(t.id)
+          changed = True
+    return [t.id for t in self.tasks if t.id in ids]
+
+  async def retry_task(self, task_id: str) -> dict[str, TaskResult]:
+    """重试失败的任务：仅重跑该任务及其下游，保留已完成子任务结果，避免重复消耗 token"""
+    if self.status != "failed":
+      raise ValueError("仅失败的工作流可以重试任务")
+
+    task_def = next((t for t in self.tasks if t.id == task_id), None)
+    if not task_def:
+      raise ValueError(f"任务不存在: {task_id}")
+    result = self.results.get(task_id)
+    if not result or result.status != TaskStatus.FAILED:
+      raise ValueError("该任务未处于失败状态，无法重试")
+
+    self._user_pause_requested = False
+    self.status = "running"
+    await self._emit("crew_resumed", {
+      "crew_id": self.id,
+      "reason": f"重试失败任务 {task_id}",
+    })
+
+    # 辩论/投票模式：整体重新执行协作流程
+    if self.collaboration_mode == "debate":
+      from backend.crew.debate import run_debate
+      return await run_debate(self)
+    if self.collaboration_mode == "voting":
+      from backend.crew.voting import run_voting
+      return await run_voting(self)
+
+    # 串行模式：重置失败任务及其下游，已完成任务保持不变
+    for tid in self._collect_downstream(task_id):
+      r = self.results.get(tid)
+      if r and r.status != TaskStatus.COMPLETED:
+        r.status = TaskStatus.PENDING
+        r.error = ""
+
+    start_idx = next(i for i, t in enumerate(self.tasks) if t.id == task_id)
+    return await self._execute_from_index(start_idx)
+
   async def run(self) -> dict[str, TaskResult]:
     """按协作模式执行任务流程"""
     self.status = "running"
@@ -273,26 +332,90 @@ class Crew:
       for tid, r in self.results.items()
       if r.status == TaskStatus.COMPLETED
     }
+    remaining = self.tasks[start_idx:]
+    semaphore = asyncio.Semaphore(max(1, settings.crew_task_concurrency))
 
-    for task_def in self.tasks[start_idx:]:
-      if self._user_pause_requested:
-        await self._handle_suspend(task_def.id)
-        return self.results
+    def _is_completed(task_id: str) -> bool:
+      result = self.results.get(task_id)
+      return result is not None and result.status == TaskStatus.COMPLETED
 
-      if task_def.id in self.results and self.results[task_def.id].status == TaskStatus.COMPLETED:
-        continue
+    def _is_terminal(task_id: str) -> bool:
+      result = self.results.get(task_id)
+      return result is not None and result.status in (
+        TaskStatus.FAILED,
+        TaskStatus.WAITING_HUMAN,
+      )
 
+    def _deps_completed(task_def: TaskDefinition) -> bool:
       for dep in task_def.depends_on:
         dep_result = self.results.get(dep)
         if not dep_result or dep_result.status != TaskStatus.COMPLETED:
+          return False
+      return True
+
+    async def _fail_unmet_dependencies(task_def: TaskDefinition) -> bool:
+      for dep in task_def.depends_on:
+        dep_result = self.results.get(dep)
+        if dep_result and dep_result.status == TaskStatus.FAILED:
           await self._fail_task(task_def.id, f"依赖任务 {dep} 未完成")
-          break
-      else:
+          return True
+        if not dep_result or dep_result.status != TaskStatus.COMPLETED:
+          return False
+      return False
+
+    async def _run_with_limit(task_def: TaskDefinition, *, resume: bool) -> str:
+      async with semaphore:
+        return await self._run_task(task_def, context, resume=resume)
+
+    while remaining:
+      if self._user_pause_requested:
+        next_task = next((t for t in remaining if not _is_completed(t.id)), None)
+        if next_task:
+          await self._handle_suspend(next_task.id)
+        return self.results
+
+      ready: list[tuple[TaskDefinition, bool]] = []
+      blocked = False
+
+      for task_def in remaining:
+        if _is_completed(task_def.id) or _is_terminal(task_def.id):
+          continue
+
+        if not _deps_completed(task_def):
+          if await _fail_unmet_dependencies(task_def):
+            blocked = True
+          continue
+
         existing = self.results.get(task_def.id)
         resume = existing is not None and existing.status == TaskStatus.SUSPENDED
-        outcome = await self._run_task(task_def, context, resume=resume)
+        if existing and existing.status == TaskStatus.RUNNING:
+          continue
+        ready.append((task_def, resume))
+
+      if blocked and not ready:
+        return self.results
+
+      if not ready:
+        if any(not _is_completed(t.id) and not _is_terminal(t.id) for t in remaining):
+          for task_def in remaining:
+            if _is_completed(task_def.id) or _is_terminal(task_def.id):
+              continue
+            if await _fail_unmet_dependencies(task_def):
+              blocked = True
+          if blocked:
+            continue
+        break
+
+      outcomes = await asyncio.gather(
+        *[_run_with_limit(task_def, resume=resume) for task_def, resume in ready],
+      )
+
+      for outcome in outcomes:
         if outcome in ("suspended", "paused", "failed"):
           return self.results
+
+      if all(_is_completed(t.id) or _is_terminal(t.id) for t in remaining):
+        break
 
     if self.status == "running":
       self.status = "completed"

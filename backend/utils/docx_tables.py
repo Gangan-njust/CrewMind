@@ -2,7 +2,8 @@
 from docx.document import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import RGBColor
+from docx.enum.text import WD_LINE_SPACING
+from docx.shared import Pt, RGBColor
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
@@ -87,3 +88,38 @@ def _normalize_table_paragraph(paragraph: Paragraph, *, is_header: bool) -> None
   for run in paragraph.runs:
     if is_header and run.bold is None:
       run.bold = True
+
+
+_FIRST_LINE_INDENT = Pt(24)
+_BODY_LINE_SPACING = Pt(20)
+_NO_INDENT_PREFIXES = ("关键词", "Keywords", "Key words", "[", "·", "•", "- ", "* ")
+
+
+def _should_indent_paragraph(text: str, style_name: str) -> bool:
+  if style_name.startswith("Heading"):
+    return False
+  stripped = text.strip()
+  if not stripped:
+    return False
+  if stripped.startswith("#"):
+    return False
+  return not any(stripped.startswith(prefix) for prefix in _NO_INDENT_PREFIXES)
+
+
+def apply_paragraph_first_line_indent(document: Document) -> None:
+  """正文段落：行距最小值 20 磅，首行缩进 2 字符。"""
+  for paragraph in document.paragraphs:
+    style_name = paragraph.style.name if paragraph.style else ""
+    if style_name.startswith("Heading"):
+      continue
+    text = paragraph.text.strip()
+    if not text:
+      continue
+
+    pf = paragraph.paragraph_format
+    pf.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
+    pf.line_spacing = _BODY_LINE_SPACING
+    pf.space_before = Pt(0)
+    pf.space_after = Pt(0)
+    if _should_indent_paragraph(paragraph.text, style_name):
+      pf.first_line_indent = _FIRST_LINE_INDENT

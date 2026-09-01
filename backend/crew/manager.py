@@ -64,6 +64,7 @@ class WorkflowManager:
     topic_id: str | None = None,
     collaboration_mode: str = "sequential",
     event_callback=None,
+    workspace_id: str | None = None,
   ) -> Crew:
     from backend.crew.collaboration import (
       CollaborationMode,
@@ -98,6 +99,7 @@ class WorkflowManager:
       user_id=user_id,
       topic_id=topic_id,
       reference_files=reference_files,
+      workspace_id=workspace_id,
       tasks=tasks,
       agent_registry=registry,
       collaboration_mode=mode.value,
@@ -137,6 +139,13 @@ class WorkflowManager:
         metadata={"collaboration_mode": crew.collaboration_mode},
       )
       return {"status": crew.status, "record_id": record_id, "results": crew._serialize_results()}
+    return {"status": crew.status, "results": crew._serialize_results()}
+
+  async def retry_workflow_task(self, crew_id: str, user_id: str, task_id: str) -> dict[str, Any]:
+    crew = self.get_crew(crew_id, user_id)
+    if not crew:
+      raise ValueError(f"工作流不存在: {crew_id}")
+    await crew.retry_task(task_id)
     return {"status": crew.status, "results": crew._serialize_results()}
 
 

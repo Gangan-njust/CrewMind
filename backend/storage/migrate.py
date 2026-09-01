@@ -9,9 +9,13 @@ from backend.storage.database import Base, get_session
 from backend.storage.models import (
   CustomAgentRecord,
   LiteratureAnalysisRecord,
+  LiteratureChunkRecord,
+  LiteratureIndexStatus,
   LiteratureRecord,
+  LLMUsageLog,
   TopicRecord,
   User,
+  UserApiConfig,
   WorkflowRecord,
   WorkflowTemplateRecord,
   WorkspaceRecord,
@@ -25,6 +29,8 @@ from backend.storage.models import (
   ExperimentAttachmentRecord,
   ExperimentDatasetRecord,
   ExperimentAnalysisRecord,
+  ExperimentMetricRecord,
+  ExperimentFileRecord,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,6 +114,22 @@ def run_migrations(engine) -> None:
       )
       logger.info("已为 literature_analysis 添加 formulas_json 列")
 
+    if _table_exists(inspector, "literature_analysis") and not _column_exists(
+      inspector, "literature_analysis", "results_json"
+    ):
+      conn.execute(
+        text("ALTER TABLE literature_analysis ADD COLUMN results_json TEXT DEFAULT '{}'")
+      )
+      logger.info("已为 literature_analysis 添加 results_json 列")
+
+    if _table_exists(inspector, "literature_analysis") and not _column_exists(
+      inspector, "literature_analysis", "images_json"
+    ):
+      conn.execute(
+        text("ALTER TABLE literature_analysis ADD COLUMN images_json TEXT DEFAULT '[]'")
+      )
+      logger.info("已为 literature_analysis 添加 images_json 列")
+
     if not _table_exists(inspector, "workspace_selections"):
       WorkspaceSelectionRecord.__table__.create(bind=conn)
       logger.info("已创建 workspace_selections 表")
@@ -146,6 +168,18 @@ def run_migrations(engine) -> None:
       conn.execute(text("ALTER TABLE writing_sections ADD COLUMN is_custom BOOLEAN DEFAULT 0"))
       logger.info("已为 writing_sections 添加 is_custom 列")
 
+    if _table_exists(inspector, "writing_projects") and not _column_exists(
+      inspector, "writing_projects", "keywords_zh_json"
+    ):
+      conn.execute(text("ALTER TABLE writing_projects ADD COLUMN keywords_zh_json TEXT DEFAULT '[]'"))
+      logger.info("已为 writing_projects 添加 keywords_zh_json 列")
+
+    if _table_exists(inspector, "writing_projects") and not _column_exists(
+      inspector, "writing_projects", "keywords_en_json"
+    ):
+      conn.execute(text("ALTER TABLE writing_projects ADD COLUMN keywords_en_json TEXT DEFAULT '[]'"))
+      logger.info("已为 writing_projects 添加 keywords_en_json 列")
+
     if not _table_exists(inspector, "experiments"):
       ExperimentRecord.__table__.create(bind=conn)
       logger.info("已创建 experiments 表")
@@ -165,6 +199,68 @@ def run_migrations(engine) -> None:
     if not _table_exists(inspector, "experiment_analyses"):
       ExperimentAnalysisRecord.__table__.create(bind=conn)
       logger.info("已创建 experiment_analyses 表")
+
+    # ── 实验模块增强：配置管理 / 进度管理 / 指标采集 / 文件版本控制 ──
+    if _table_exists(inspector, "experiments") and not _column_exists(
+      inspector, "experiments", "config_json"
+    ):
+      conn.execute(text("ALTER TABLE experiments ADD COLUMN config_json TEXT DEFAULT '{}'"))
+      logger.info("已为 experiments 添加 config_json 列")
+
+    if _table_exists(inspector, "experiments") and not _column_exists(
+      inspector, "experiments", "progress"
+    ):
+      conn.execute(text("ALTER TABLE experiments ADD COLUMN progress INTEGER DEFAULT 0"))
+      logger.info("已为 experiments 添加 progress 列")
+
+    if _table_exists(inspector, "experiments") and not _column_exists(
+      inspector, "experiments", "current_step"
+    ):
+      conn.execute(text("ALTER TABLE experiments ADD COLUMN current_step VARCHAR(128) DEFAULT ''"))
+      logger.info("已为 experiments 添加 current_step 列")
+
+    if _table_exists(inspector, "experiments") and not _column_exists(
+      inspector, "experiments", "steps_json"
+    ):
+      conn.execute(text("ALTER TABLE experiments ADD COLUMN steps_json TEXT DEFAULT '[]'"))
+      logger.info("已为 experiments 添加 steps_json 列")
+
+    if not _table_exists(inspector, "experiment_metrics"):
+      ExperimentMetricRecord.__table__.create(bind=conn)
+      logger.info("已创建 experiment_metrics 表")
+
+    if not _table_exists(inspector, "experiment_files"):
+      ExperimentFileRecord.__table__.create(bind=conn)
+      logger.info("已创建 experiment_files 表")
+
+    if not _table_exists(inspector, "literature_chunks"):
+      LiteratureChunkRecord.__table__.create(bind=conn)
+      logger.info("已创建 literature_chunks 表")
+
+    if not _table_exists(inspector, "literature_index_status"):
+      LiteratureIndexStatus.__table__.create(bind=conn)
+      logger.info("已创建 literature_index_status 表")
+
+    if not _table_exists(inspector, "literature_chunks_fts"):
+      conn.execute(text("""
+        CREATE VIRTUAL TABLE literature_chunks_fts USING fts5(
+          chunk_id UNINDEXED,
+          literature_id UNINDEXED,
+          workspace_id UNINDEXED,
+          section_key UNINDEXED,
+          content,
+          tokenize='unicode61'
+        )
+      """))
+      logger.info("已创建 literature_chunks_fts FTS5 虚拟表")
+
+    if not _table_exists(inspector, "user_api_configs"):
+      UserApiConfig.__table__.create(bind=conn)
+      logger.info("已创建 user_api_configs 表")
+
+    if not _table_exists(inspector, "llm_usage_logs"):
+      LLMUsageLog.__table__.create(bind=conn)
+      logger.info("已创建 llm_usage_logs 表")
 
   _backfill_writing_section_order()
   _ensure_admin_user()

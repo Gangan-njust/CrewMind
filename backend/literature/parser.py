@@ -50,14 +50,24 @@ def extract_full_text(pdf_path: str | Path, *, use_cache: bool = True) -> str:
   if not path.exists():
     raise FileNotFoundError(f"PDF 文件不存在: {path}")
 
-  reader = PdfReader(str(path))
-  parts: list[str] = []
-  for page in reader.pages:
-    text = page.extract_text() or ""
-    if text.strip():
-      parts.append(text)
+  try:
+    reader = PdfReader(str(path))
+    parts: list[str] = []
+    for page in reader.pages:
+      text = page.extract_text() or ""
+      if text.strip():
+        parts.append(text)
 
-  full_text = sanitize_unicode("\n\n".join(parts).strip())
+    full_text = sanitize_unicode("\n\n".join(parts).strip())
+  except Exception as e:
+    err = str(e)
+    if "cryptography" in err.lower() or "AES algorithm" in err:
+      raise RuntimeError(
+        "PDF 为加密格式，需要安装 cryptography 依赖。"
+        "请运行: py -m pip install \"cryptography>=3.1\" 后重启服务"
+      ) from e
+    raise
+
   if use_cache:
     _TEXT_CACHE[key] = full_text
   return full_text

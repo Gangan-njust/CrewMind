@@ -94,6 +94,22 @@ async def get_current_user(
   return user
 
 
+async def get_current_user_optional(
+  credentials: HTTPAuthorizationCredentials | None = Depends(security),
+) -> User | None:
+  """可选认证：未带凭证时返回 None（用于支持 query token 的下载接口）"""
+  if not credentials:
+    return None
+  try:
+    payload = decode_token(credentials.credentials)
+  except HTTPException:
+    return None
+  user_id = payload.get("sub")
+  if not user_id:
+    return None
+  return get_user_by_id(user_id)
+
+
 def serialize_user(user: User) -> dict:
   return {
     "id": user.id,

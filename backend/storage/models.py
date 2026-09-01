@@ -130,11 +130,50 @@ class LiteratureAnalysisRecord(Base):
   limitations_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
   citation_templates_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
   formulas_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+  results_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+  images_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
   research_background: Mapped[str] = mapped_column(Text, nullable=False, default="")
   research_goal: Mapped[str] = mapped_column(Text, nullable=False, default="")
   methods_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
   conclusion: Mapped[str] = mapped_column(Text, nullable=False, default="")
   created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+  updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class LiteratureChunkRecord(Base):
+  __tablename__ = "literature_chunks"
+
+  id: Mapped[str] = mapped_column(String(36), primary_key=True)
+  literature_id: Mapped[str] = mapped_column(
+    String(36), ForeignKey("literatures.id"), index=True, nullable=False
+  )
+  workspace_id: Mapped[str] = mapped_column(
+    String(36), ForeignKey("workspaces.id"), index=True, nullable=False
+  )
+  section_key: Mapped[str] = mapped_column(String(64), index=True, nullable=False, default="")
+  chunk_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+  content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+  content_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+  char_start: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+  char_end: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+  created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class LiteratureIndexStatus(Base):
+  __tablename__ = "literature_index_status"
+
+  id: Mapped[str] = mapped_column(String(36), primary_key=True)
+  literature_id: Mapped[str] = mapped_column(
+    String(36), ForeignKey("literatures.id"), index=True, nullable=False, unique=True
+  )
+  workspace_id: Mapped[str] = mapped_column(
+    String(36), ForeignKey("workspaces.id"), index=True, nullable=False
+  )
+  status: Mapped[str] = mapped_column(String(32), index=True, nullable=False, default="pending")
+  content_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+  chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+  error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+  indexed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
   updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
@@ -166,6 +205,8 @@ class WritingProjectRecord(Base):
     String(36), ForeignKey("workspaces.id"), index=True, nullable=True
   )
   outline_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+  keywords_zh_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+  keywords_en_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
   citation_format: Mapped[str] = mapped_column(String(32), nullable=False, default="gb7714")
   created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
   updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
@@ -228,7 +269,13 @@ class ExperimentRecord(Base):
   description: Mapped[str] = mapped_column(Text, nullable=False, default="")
   source_workflow_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
   expected_metrics_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+  # 实验配置：超参数 / 环境 / 代码版本 / 备注（可复现所需上下文）
+  config_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
   status: Mapped[str] = mapped_column(String(32), index=True, nullable=False, default="active")
+  # 进度管理：0-100 进度百分比、当前阶段、阶段列表
+  progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+  current_step: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+  steps_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
   created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
   updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
@@ -296,3 +343,70 @@ class ExperimentAnalysisRecord(Base):
   charts_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
   stats_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
   created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class ExperimentMetricRecord(Base):
+  """训练指标序列：按 (step, metric_name) 记录一条指标值"""
+
+  __tablename__ = "experiment_metrics"
+
+  id: Mapped[str] = mapped_column(String(36), primary_key=True)
+  experiment_id: Mapped[str] = mapped_column(
+    String(36), ForeignKey("experiments.id"), index=True, nullable=False
+  )
+  metric_name: Mapped[str] = mapped_column(String(128), index=True, nullable=False, default="")
+  step: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+  value: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+  unit: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+  created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class ExperimentFileRecord(Base):
+  """实验文件（模型/日志/脚本等）：同名文件自动递增版本号保留历史"""
+
+  __tablename__ = "experiment_files"
+
+  id: Mapped[str] = mapped_column(String(36), primary_key=True)
+  experiment_id: Mapped[str] = mapped_column(
+    String(36), ForeignKey("experiments.id"), index=True, nullable=False
+  )
+  filename: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+  file_type: Mapped[str] = mapped_column(String(32), nullable=False, default="other")
+  file_path: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+  file_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+  version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+  meta_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+  created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class UserApiConfig(Base):
+  """用户自定义 LLM API 配置（未配置时使用系统 Key）"""
+
+  __tablename__ = "user_api_configs"
+
+  user_id: Mapped[str] = mapped_column(
+    String(36), ForeignKey("users.id"), primary_key=True
+  )
+  api_key: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+  base_url: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+  model: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+  updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class LLMUsageLog(Base):
+  """LLM 调用用量日志（token 数、耗时、调用次数等）"""
+
+  __tablename__ = "llm_usage_logs"
+
+  id: Mapped[str] = mapped_column(String(36), primary_key=True)
+  user_id: Mapped[str | None] = mapped_column(
+    String(36), ForeignKey("users.id"), index=True, nullable=True
+  )
+  run_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+  source: Mapped[str] = mapped_column(String(32), index=True, nullable=False, default="workflow")
+  model: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+  prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+  completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+  total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+  duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+  created_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)

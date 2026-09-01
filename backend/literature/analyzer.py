@@ -10,15 +10,18 @@ from typing import Any, Callable, Awaitable
 from sqlalchemy import select
 
 from backend.config import settings
-from backend.literature.parser import extract_full_text, resolve_pdf_path
+from backend.literature.content import empty_content_error, resolve_literature_full_text
+from backend.literature.parser import resolve_pdf_path
 from backend.utils.text import sanitize_unicode, sanitize_deep
 from backend.literature.prompts import (
   CITATION_TEMPLATES_PROMPT,
   CORE_EXTRACTION_PROMPT,
   FORMULA_EXTRACTION_PROMPT,
+  IMAGE_PLACEMENT_PROMPT,
   INNOVATION_PROMPT,
   RELEVANCE_SCORE_PROMPT,
   RESEARCH_GAP_PROMPT,
+  RESULTS_EXTRACTION_PROMPT,
   TAG_GENERATION_PROMPT,
 )
 from backend.literature.section_splitter import split_sections
@@ -103,41 +106,43 @@ def _load_literature_content(literature_id: str) -> dict[str, Any]:
 
     meta = {
       "literature_id": literature_id,
+      "workspace_id": lit.workspace_id,
       "title": lit.title or "",
       "authors": json.loads(lit.authors_json or "[]"),
       "journal": lit.journal or "",
       "year": lit.year,
       "abstract": lit.abstract or "",
-      "content": sanitize_unicode((lit.full_text or "").strip()),
+      "content": "",
       "pdf_path": lit.pdf_path or "",
     }
+
+  content, pdf_err = resolve_literature_full_text(lit, persist=True)
+  meta["content"] = content
 
   if not meta["content"]:
     if not meta["pdf_path"]:
       _set_literature_status(literature_id, "failed")
-      raise ValueError("文献内容为空，请重新上传 PDF")
+      raise ValueError(empty_content_error(lit, pdf_err=pdf_err))
 
-    try:
-      resolved = resolve_pdf_path(meta["pdf_path"])
-      if not resolved.exists():
-        _set_literature_status(literature_id, "failed")
-        raise ValueError(f"PDF 文件不存在: {resolved}")
-      content = extract_full_text(resolved, use_cache=True)
-      meta["content"] = content
-      with get_session() as session:
-        lit = session.get(LiteratureRecord, literature_id)
-        if lit:
-          lit.full_text = sanitize_unicode(content)
-          if not lit.pdf_path:
-            lit.pdf_path = str(resolved)
-          session.commit()
-    except ValueError:
-      raise
-    except Exception as e:
+    resolved = resolve_pdf_path(meta["pdf_path"])
+    if not resolved.exists():
       _set_literature_status(literature_id, "failed")
-      raise ValueError(f"PDF 解析失败: {e}") from e
+      raise ValueError(f"PDF 文件不存在: {resolved}")
+    _set_literature_status(literature_id, "failed")
+    raise ValueError(empty_content_error(lit, pdf_err=pdf_err))
 
   return meta
+
+
+async def _ensure_indexed(literature_id: str) -> None:
+  """分析前先同步完成 RAG 索引，保证按切块索引结果进行检索分析"""
+  if not settings.rag_enabled:
+    return
+  try:
+    from backend.rag.indexer import index_literature
+    await asyncio.to_thread(index_literature, literature_id)
+  except Exception:
+    logger.warning("分析前索引失败，将回退全文截取分析: %s", literature_id, exc_info=True)
 
 
 def _save_analysis_result(literature_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -168,6 +173,8 @@ def _save_analysis_result(literature_id: str, payload: dict[str, Any]) -> dict[s
     analysis.limitations_json = json.dumps(payload["limitations"], ensure_ascii=False)
     analysis.citation_templates_json = json.dumps(payload["citation_templates"], ensure_ascii=False)
     analysis.formulas_json = json.dumps(payload.get("formulas", []), ensure_ascii=False)
+    analysis.results_json = json.dumps(payload.get("results", {}), ensure_ascii=False)
+    analysis.images_json = json.dumps(payload.get("images", []), ensure_ascii=False)
     analysis.research_background = payload["research_background"]
     analysis.research_goal = payload["research_goal"]
     analysis.methods_summary = payload["methods_summary"]
@@ -187,6 +194,8 @@ def _save_analysis_result(literature_id: str, payload: dict[str, Any]) -> dict[s
       "limitations": payload["limitations"],
       "citation_templates": payload["citation_templates"],
       "formulas": payload.get("formulas", []),
+      "results": payload.get("results", {}),
+      "images": payload.get("images", []),
       "research_background": payload["research_background"],
       "research_goal": payload["research_goal"],
       "methods_summary": payload["methods_summary"],
@@ -204,13 +213,35 @@ async def analyze_single_literature(
   meta = _load_literature_content(literature_id)
   content = meta["content"]
   sections = split_sections(content)
-  content_sample = _truncate(content or meta["abstract"] or "")
+
+  # 先完成 RAG 索引，再基于切块索引结果检索分析
+  await _ensure_indexed(literature_id)
+
+  from backend.rag.analysis_helpers import build_literature_analysis_context
+
+  content_sample, used_rag = build_literature_analysis_context(
+    meta.get("workspace_id", ""),
+    literature_id,
+    meta["title"] or "",
+    meta["abstract"] or "",
+    content,
+  )
+  if used_rag:
+    logger.info("文献 %s 核心提取使用 RAG 上下文", literature_id)
+  else:
+    content_sample = _truncate(content or meta["abstract"] or "")
 
   core = await _llm_json(CORE_EXTRACTION_PROMPT.format(
     title=meta["title"] or "未知标题",
     authors=", ".join(meta["authors"]) if meta["authors"] else "未知",
     journal=meta["journal"] or "未知",
     year=meta["year"] or "未知",
+    content=content_sample,
+  ))
+
+  results = await _llm_json(RESULTS_EXTRACTION_PROMPT.format(
+    title=meta["title"] or "未知标题",
+    methods=core.get("methods_summary", "") or "未提供",
     content=content_sample,
   ))
 
@@ -228,7 +259,24 @@ async def analyze_single_literature(
   methods_summary = core.get("methods_summary", "")
   section_map = sections.to_dict()
   formula_source = section_map.get("methods") or section_map.get("results") or content_sample
-  formula_content = _truncate(formula_source, max_len=8000)
+
+  from backend.rag.analysis_helpers import retrieve_multi_query
+
+  formula_hits: list[dict] = []
+  try:
+    formula_hits = retrieve_multi_query(
+      meta.get("workspace_id", ""),
+      [f"{meta['title']} 公式 算法 模型"],
+      literature_ids=[literature_id],
+      section_keys=["methods", "results"],
+    )
+  except Exception:
+    logger.warning("公式 RAG 检索失败，回退全文截取: %s", literature_id, exc_info=True)
+  if formula_hits:
+    from backend.rag.context_builder import build_rag_context
+    formula_content = build_rag_context(formula_hits, max_chars=8000)
+  else:
+    formula_content = _truncate(formula_source, max_len=8000)
   formulas_result = await _llm_json(FORMULA_EXTRACTION_PROMPT.format(
     title=meta["title"] or "未知标题",
     methods=methods_summary or "未提供",
@@ -258,6 +306,50 @@ async def analyze_single_literature(
   domain_tags = tags.get("domain_tags", [])
   all_tags = list(dict.fromkeys(method_tags + domain_tags))
 
+  # 提取文章中的图片供展示（存在 PDF 时）
+  images: list[dict] = []
+  if meta.get("pdf_path"):
+    try:
+      from backend.literature.images import extract_pdf_images
+      images = extract_pdf_images(
+        meta["pdf_path"],
+        meta.get("workspace_id", ""),
+        literature_id,
+      )
+    except Exception:
+      logger.warning("文献图片提取失败: %s", literature_id, exc_info=True)
+
+  # 让 LLM 根据「页码 + 所在页文字上下文」把每张图归属到对应章节，便于在内容处内联展示
+  if images:
+    try:
+      image_list = "\n".join(
+        f"[{i + 1}] {img['filename']} | 第{img.get('page', '?')}页 | 上下文: {(img.get('context') or '')[:200]}"
+        for i, img in enumerate(images)
+      )
+      placements = await _llm_json(IMAGE_PLACEMENT_PROMPT.format(
+        title=meta["title"] or "未知标题",
+        methods=methods_summary or "未提供",
+        results=results.get("results_summary", "") or core.get("conclusion", ""),
+        images=image_list,
+      ))
+      placed_by_file = {
+        p.get("filename"): p
+        for p in placements.get("image_placements", [])
+        if p.get("filename")
+      }
+      for img in images:
+        placed = placed_by_file.get(img["filename"], {})
+        section = (placed.get("section") or "results").strip()
+        img["section"] = section if section in {
+          "background", "methods", "results", "discussion", "conclusion",
+        } else "results"
+        img["caption"] = (placed.get("caption") or "").strip()
+    except Exception:
+      logger.warning("图片章节归属分析失败，默认归入结果章节: %s", literature_id, exc_info=True)
+      for img in images:
+        img.setdefault("section", "results")
+        img.setdefault("caption", "")
+
   return _save_analysis_result(literature_id, sanitize_deep({
     "tags": all_tags,
     "contribution_summary": core.get("contribution_summary", ""),
@@ -267,6 +359,13 @@ async def analyze_single_literature(
     "limitations": core.get("limitations", []),
     "citation_templates": citations.get("citations", []),
     "formulas": formulas_result.get("formulas", []),
+    "results": {
+      "article_summary": results.get("article_summary", ""),
+      "results_summary": results.get("results_summary", ""),
+      "result_items": results.get("result_items", []),
+      "important_figures": results.get("important_figures", []),
+    },
+    "images": images,
     "research_background": core.get("research_background", ""),
     "research_goal": core.get("research_goal", ""),
     "methods_summary": methods_summary,
@@ -341,8 +440,15 @@ async def identify_research_gaps(workspace_id: str, user_topic: str) -> dict:
   if not summaries:
     return {"research_gaps": [], "future_directions": []}
 
+  from backend.rag.analysis_helpers import build_research_gap_context
+
+  rag_evidence, used_rag = build_research_gap_context(workspace_id, user_topic)
+  if used_rag:
+    logger.info("研究空白分析使用 RAG 多 query 检索: workspace=%s", workspace_id)
+
   prompt = RESEARCH_GAP_PROMPT.format(
     user_topic=user_topic,
     literature_summaries="\n".join(summaries),
+    rag_evidence=rag_evidence or "（未检索到额外原文证据，请基于摘要推断）",
   )
   return await _llm_json(prompt)

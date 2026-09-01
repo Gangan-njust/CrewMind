@@ -8,6 +8,7 @@ from backend.agents.roles import AgentRole
 from backend.tools.code_interpreter import CodeInterpreterTool
 from backend.tools.file_parser import FileParserTool
 from backend.tools.keywords import extract_search_query
+from backend.tools.rag_search import RagSearchTool
 from backend.tools.web_search import WebSearchTool
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,7 @@ TOOL_REGISTRY: dict[str, Any] = {
   "web_search": WebSearchTool(),
   "file_parser": FileParserTool(),
   "code_interpreter": CodeInterpreterTool(),
+  "rag_search": RagSearchTool(),
 }
 
 # 向后兼容
@@ -32,6 +34,7 @@ async def run_agent_tools(
   reference_files: list[str],
   partial_output: str,
   on_tool_event: ToolEventCallback | None = None,
+  workspace_id: str | None = None,
 ) -> list[dict[str, str]]:
   """按 Agent 配置执行工具，返回需追加到 messages 的用户消息列表"""
   if partial_output:
@@ -60,6 +63,23 @@ async def run_agent_tools(
       except Exception as e:
         logger.warning("file_parser 失败: %s", e)
         await _emit("file_parser", "failed", str(e))
+
+  if "rag_search" in tools and workspace_id:
+    rag_tool = TOOL_REGISTRY.get("rag_search")
+    if rag_tool:
+      query = extract_search_query(user_input, task_prompt)
+      if query:
+        await _emit("rag_search", "started", f"本地文献库检索: {query[:80]}")
+        try:
+          search_result = await rag_tool.run(query=query, workspace_id=workspace_id)
+          await _emit("rag_search", "completed", "本地文献库检索完成")
+          messages.append({
+            "role": "user",
+            "content": f"## 本地文献库检索结果\n\n检索词: {query}\n\n{search_result}",
+          })
+        except Exception as e:
+          logger.warning("rag_search 失败: %s", e)
+          await _emit("rag_search", "failed", str(e))
 
   if "web_search" in tools:
     search_tool = TOOL_REGISTRY.get("web_search")

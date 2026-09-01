@@ -11,6 +11,7 @@ from backend.storage.models import LiteratureAnalysisRecord, LiteratureRecord
 from backend.writing.prompts import (
   CITATION_COMPLETENESS_PROMPT,
   CITATION_RECOMMEND_PROMPT,
+  CITATION_RECOMMEND_RAG_PROMPT,
   CITATION_SENTENCE_PROMPT,
 )
 
@@ -91,6 +92,43 @@ async def recommend_citations(
   if not literatures:
     return {"recommendations": [], "message": "文献库为空"}
 
+  from backend.config import settings as app_settings
+
+  if app_settings.rag_enabled:
+    try:
+      from backend.rag.context_builder import build_rag_context
+      from backend.rag.retriever import retrieve
+      query = f"{selected_text}\n{context[:500]}"
+      hits = retrieve(workspace_id, query)
+      if hits:
+        rag_evidence = build_rag_context(hits, max_chars=5000)
+        prompt = CITATION_RECOMMEND_RAG_PROMPT.format(
+          selected_text=selected_text,
+          context=context[:2000],
+          rag_evidence=rag_evidence,
+        )
+        result = await _llm_json(prompt)
+        recs = result.get("recommendations", [])
+        lit_map = {l["id"]: l for l in literatures}
+        hit_map = {h["chunk_id"]: h for h in hits}
+        enriched = []
+        for rec in recs:
+          lit_id = rec.get("literature_id", "")
+          chunk_id = rec.get("chunk_id", "")
+          if lit_id in lit_map:
+            hit = hit_map.get(chunk_id, {})
+            enriched.append({
+              **rec,
+              "literature": lit_map[lit_id],
+              "excerpt": rec.get("excerpt") or hit.get("excerpt") or hit.get("content", "")[:500],
+              "section_key": rec.get("section_key") or hit.get("section_key", ""),
+              "chunk_id": chunk_id or hit.get("chunk_id", ""),
+            })
+        if enriched:
+          return {"recommendations": enriched, "rag_used": True}
+    except Exception as e:
+      logger.warning("RAG 引文推荐失败，回退标题列表: %s", e)
+
   lit_list = "\n".join(
     f"- ID:{l['id']} | {l['title']} ({l['year'] or 'n.d.'}) | {', '.join(l['authors'][:3])}"
     for l in literatures[:30]
@@ -111,7 +149,7 @@ async def recommend_citations(
       lit_id = rec.get("literature_id", "")
       if lit_id in lit_map:
         enriched.append({**rec, "literature": lit_map[lit_id]})
-    return {"recommendations": enriched}
+    return {"recommendations": enriched, "fallback": True}
   except Exception as e:
     logger.error("引用推荐失败: %s", e)
     keyword_matches = _keyword_match(selected_text, literatures)
@@ -172,6 +210,55 @@ async def check_citation_completeness(full_text: str) -> dict:
   except Exception as e:
     logger.error("引用完整性检查失败: %s", e)
     return {"missing_citations": [], "error": str(e)}
+
+
+async def apply_citation(
+  project_id: str,
+  user_id: str,
+  section_id: str,
+  literature_id: str,
+  selected_text: str = "",
+  purpose: str = "",
+) -> dict:
+  from backend.storage.writing_store import writing_store
+  from backend.writing.export import get_bibliography_for_project
+
+  project = writing_store.get_project(project_id, user_id)
+  index, is_new = writing_store.assign_citation_index(
+    project_id,
+    user_id,
+    section_id,
+    literature_id,
+    selected_text,
+  )
+
+  purpose_text = purpose or selected_text or "一般引用"
+  sentences_result = await generate_citation_sentences(literature_id, purpose_text)
+  sentences = sentences_result.get("sentences", [])
+
+  marker = f"[{index}]"
+  selected = selected_text.strip()
+  if selected:
+    insert_text = f"{selected}{marker}"
+  elif sentences:
+    sentence = sentences[0].get("text", "")
+    insert_text = sentence if marker in sentence else f"{sentence.rstrip('.。')}{marker}"
+  else:
+    insert_text = f"相关研究{marker}"
+
+  bibliography = get_bibliography_for_project(project_id, user_id, project)
+  writing_store.sync_bibliography_section(project_id, user_id, bibliography)
+  updated_project = writing_store.get_project(project_id, user_id)
+
+  return {
+    "index": index,
+    "citation_marker": marker,
+    "insert_text": insert_text,
+    "sentences": sentences,
+    "is_new_reference": is_new,
+    "bibliography": bibliography,
+    "project": updated_project,
+  }
 
 
 def format_reference(lit: dict, fmt: str = "gb7714") -> str:

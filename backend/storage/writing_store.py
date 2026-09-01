@@ -13,7 +13,16 @@ from backend.storage.models import (
   WritingSectionRecord,
   WritingSectionVersionRecord,
 )
+from backend.storage.literature_store import literature_store
+from backend.writing.paragraph_format import ensure_paragraph_first_indent
 from backend.writing.templates import DEFAULT_SECTIONS, PAPER_TEMPLATES, SECTION_LABELS, section_display_title
+
+
+def _normalize_workspace_id(workspace_id: str | None) -> str | None:
+  if workspace_id is None:
+    return None
+  workspace_id = workspace_id.strip()
+  return workspace_id or None
 
 
 def _load_json(text: str, default=None):
@@ -29,6 +38,9 @@ def _count_words(text: str) -> int:
   chinese = len([c for c in text if "\u4e00" <= c <= "\u9fff"])
   english = len(text.split()) - chinese
   return chinese + max(english, 0)
+
+
+BIBLIOGRAPHY_SECTION_TITLE = "参考文献"
 
 
 class WritingStore:
@@ -59,6 +71,8 @@ class WritingStore:
       "source_workflow_id": project.source_workflow_id,
       "workspace_id": project.workspace_id,
       "outline": _load_json(project.outline_json, []),
+      "keywords_zh": _load_json(project.keywords_zh_json, []),
+      "keywords_en": _load_json(project.keywords_en_json, []),
       "citation_format": project.citation_format,
       "created_at": project.created_at.isoformat(),
       "updated_at": project.updated_at.isoformat(),
@@ -107,6 +121,8 @@ class WritingStore:
         "target_journal": p.target_journal,
         "source_workflow_id": p.source_workflow_id,
         "workspace_id": p.workspace_id,
+        "keywords_zh": _load_json(p.keywords_zh_json, []),
+        "keywords_en": _load_json(p.keywords_en_json, []),
         "citation_format": p.citation_format,
         "created_at": p.created_at.isoformat(),
         "updated_at": p.updated_at.isoformat(),
@@ -182,6 +198,10 @@ class WritingStore:
     if paper_type not in PAPER_TEMPLATES:
       raise ValueError(f"不支持的论文类型: {paper_type}")
 
+    workspace_id = _normalize_workspace_id(workspace_id)
+    if workspace_id:
+      literature_store._verify_workspace(workspace_id, user_id)
+
     now = datetime.now()
     project_id = str(uuid.uuid4())
     section_types = DEFAULT_SECTIONS.get(paper_type, DEFAULT_SECTIONS["journal"])
@@ -242,6 +262,8 @@ class WritingStore:
     target_journal: str | None = None,
     workspace_id: str | None = None,
     outline: list | None = None,
+    keywords_zh: list | None = None,
+    keywords_en: list | None = None,
     citation_format: str | None = None,
   ) -> dict:
     self._verify_project(project_id, user_id)
@@ -258,9 +280,16 @@ class WritingStore:
       if target_journal is not None:
         project.target_journal = target_journal
       if workspace_id is not None:
-        project.workspace_id = workspace_id
+        normalized = _normalize_workspace_id(workspace_id)
+        if normalized:
+          literature_store._verify_workspace(normalized, user_id)
+        project.workspace_id = normalized
       if outline is not None:
         project.outline_json = json.dumps(outline, ensure_ascii=False)
+      if keywords_zh is not None:
+        project.keywords_zh_json = json.dumps(keywords_zh, ensure_ascii=False)
+      if keywords_en is not None:
+        project.keywords_en_json = json.dumps(keywords_en, ensure_ascii=False)
       if citation_format is not None:
         project.citation_format = citation_format
       project.updated_at = datetime.now()
@@ -297,6 +326,7 @@ class WritingStore:
     version_note: str = "",
   ) -> dict:
     self._verify_section(section_id, user_id)
+    content = ensure_paragraph_first_indent(content)
     now = datetime.now()
     word_count = _count_words(content)
 
@@ -371,6 +401,70 @@ class WritingStore:
       target["content"],
       save_version=True,
       version_note=f"回滚至 v{target_version}",
+    )
+
+  def get_ordered_literature_ids(self, project_id: str, user_id: str) -> list[str]:
+    refs = self.list_references(project_id, user_id)
+    return list(dict.fromkeys(r["literature_id"] for r in refs))
+
+  def assign_citation_index(
+    self,
+    project_id: str,
+    user_id: str,
+    section_id: str,
+    literature_id: str,
+    citation_context: str = "",
+  ) -> tuple[int, bool]:
+    lit_ids = self.get_ordered_literature_ids(project_id, user_id)
+    if literature_id in lit_ids:
+      return lit_ids.index(literature_id) + 1, False
+    self.add_reference(section_id, user_id, literature_id, citation_context)
+    return len(lit_ids) + 1, True
+
+  def sync_bibliography_section(
+    self,
+    project_id: str,
+    user_id: str,
+    bibliography: list[dict],
+  ) -> dict | None:
+    if not bibliography:
+      return None
+
+    project = self.get_project(project_id, user_id)
+    sections = project["sections"]
+    content = "\n\n".join(
+      f"[{ref['index']}] {ref['formatted']}" for ref in bibliography
+    )
+
+    bib_section = next(
+      (s for s in sections if s.get("title") == BIBLIOGRAPHY_SECTION_TITLE),
+      None,
+    )
+    if bib_section:
+      if bib_section["content"].strip() == content.strip():
+        return bib_section
+      return self.update_section(
+        bib_section["id"],
+        user_id,
+        content,
+        save_version=True,
+        version_note="参考文献自动更新",
+      )
+
+    last_sec = sections[-1] if sections else None
+    after_id = last_sec["id"] if last_sec else None
+    new_sec = self.create_section(
+      project_id,
+      user_id,
+      BIBLIOGRAPHY_SECTION_TITLE,
+      after_section_id=after_id,
+    )
+    return self.update_section(
+      new_sec["id"],
+      user_id,
+      content,
+      save_version=True,
+      version_note="参考文献自动生成",
     )
 
   def add_reference(

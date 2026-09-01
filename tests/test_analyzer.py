@@ -31,7 +31,7 @@ def sample_literature():
       id=lit_id, workspace_id=ws_id, title="Test Paper",
       authors_json='["Alice", "Bob"]', journal="Test Journal", year=2024,
       doi="10.1234/test", abstract="Test abstract",
-      pdf_path="", full_text="Introduction\nThis is a test paper about AI.",
+      pdf_path="test.pdf", full_text="Introduction\nThis is a test paper about AI.",
       uploaded_at=datetime.now(), status="pending",
     ))
     session.commit()
@@ -50,6 +50,12 @@ async def test_analyze_single_literature_mock(sample_literature):
       "limitations": ["局限1"],
       "contribution_summary": "贡献",
     }),
+    json.dumps({
+      "article_summary": "文章讲了什么",
+      "results_summary": "结果概述",
+      "result_items": ["结果1：准确率 90.2%", "结果2：速度提升 1.5 倍"],
+      "important_figures": ["图3：性能对比"],
+    }),
     json.dumps({"innovations": ["创新"], "novelty_score": 8}),
     json.dumps({"method_tags": ["深度学习"], "domain_tags": ["AI"]}),
     json.dumps({
@@ -63,6 +69,13 @@ async def test_analyze_single_literature_mock(sample_literature):
     }),
     json.dumps({"citations": [{"zh": "中文引用", "en": "English cite"}]}),
     json.dumps({"relevance_score": 8.5, "recommendation_score": 9.0, "reason": "相关"}),
+    json.dumps({
+      "image_placements": [{
+        "filename": "001-fig1.png",
+        "section": "results",
+        "caption": "性能对比图",
+      }],
+    }),
   ]
   call_count = 0
 
@@ -73,14 +86,28 @@ async def test_analyze_single_literature_mock(sample_literature):
     return result
 
   with patch("backend.literature.analyzer.llm_client.chat", new=AsyncMock(side_effect=mock_chat)):
-    from backend.literature.analyzer import analyze_single_literature
-    result = await analyze_single_literature(sample_literature, user_topic="人工智能")
+    with patch(
+      "backend.rag.analysis_helpers.build_literature_analysis_context",
+      return_value=("Introduction\nThis is a test paper about AI.", False),
+    ):
+      with patch("backend.rag.analysis_helpers.retrieve_multi_query", return_value=[]):
+        with patch("backend.literature.analyzer._ensure_indexed", new=AsyncMock()):
+          with patch("backend.literature.images.extract_pdf_images", return_value=[{
+            "filename": "001-fig1.png", "page": 2, "width": 640, "height": 480,
+          }]):
+            from backend.literature.analyzer import analyze_single_literature
+            result = await analyze_single_literature(sample_literature, user_topic="人工智能")
 
   assert result["literature_id"] == sample_literature
   assert result["contribution_summary"] == "贡献"
   assert result["relevance_score"] == 8.5
   assert len(result["formulas"]) == 1
   assert result["formulas"][0]["name"] == "交叉熵损失"
+  assert result["results"]["article_summary"] == "文章讲了什么"
+  assert result["results"]["result_items"][0].startswith("结果1")
+  assert result["images"][0]["filename"] == "001-fig1.png"
+  assert result["images"][0]["section"] == "results"
+  assert result["images"][0]["caption"] == "性能对比图"
 
   with get_session() as session:
     lit = session.get(LiteratureRecord, sample_literature)
