@@ -3,7 +3,7 @@ import json
 import re
 from typing import Literal
 
-from backend.literature.prompts import PROPOSAL_CONTEXT_PROMPT
+from backend.literature.prompts import LITERATURE_REVIEW_CONTEXT_PROMPT, PROPOSAL_CONTEXT_PROMPT
 from backend.storage.literature_store import literature_store
 from backend.utils.text import sanitize_unicode
 
@@ -91,6 +91,80 @@ def build_proposal_context(
   return PROPOSAL_CONTEXT_PROMPT.format(
     topic=topic,
     literature_context=literature_context,
+    mode_description=MODE_DESCRIPTIONS.get(mode, MODE_DESCRIPTIONS["library_first"]),
+  )
+
+
+def _format_literature_review_entry(idx: int, lit: dict) -> str:
+  """将单篇文献及其分析结果格式化为综述素材条目（含参考文献著录行）。"""
+  analysis = lit.get("analysis") or {}
+  authors = lit.get("authors", []) or []
+  authors_text = ", ".join(str(a) for a in authors[:6])
+  if len(authors) > 6:
+    authors_text += ", 等"
+  journal = lit.get("journal", "") or ""
+  year = lit.get("year", "") or ""
+  doi = lit.get("doi", "") or ""
+
+  ref_line = f"[{idx}] {authors_text}. {lit.get('title', '')}"
+  if journal:
+    ref_line += f". {journal}"
+  if year:
+    ref_line += f", {year}"
+  if doi:
+    ref_line += f". DOI: {doi}"
+  parts: list[str] = [f"### 文献 {idx}：{sanitize_unicode(lit.get('title', ''))}", "", f"参考著录：{sanitize_unicode(ref_line)}"]
+
+  tags = analysis.get("tags", []) or []
+  if tags:
+    parts.append(f"- 主题标签：{'、'.join(str(t) for t in tags)}")
+  if analysis.get("relevance_score") is not None:
+    parts.append(f"- 与主题匹配度评分：{analysis.get('relevance_score')}")
+  if analysis.get("research_background") or analysis.get("research_goal"):
+    bg = sanitize_unicode(analysis.get("research_background", "")).strip()
+    goal = sanitize_unicode(analysis.get("research_goal", "")).strip()
+    detail = "；".join(x for x in (f"背景：{bg}" if bg else "", f"目标：{goal}" if goal else "") if x)
+    if detail:
+      parts.append(f"- 研究背景与目标：{detail}")
+  methods = sanitize_unicode(analysis.get("methods_summary", "")).strip()
+  if methods:
+    parts.append(f"- 研究方法：{methods}")
+  contribution = sanitize_unicode(analysis.get("contribution_summary", "")).strip()
+  if contribution:
+    parts.append(f"- 核心贡献：{contribution}")
+  findings = [str(f) for f in (analysis.get("key_findings", []) or [])]
+  if findings:
+    parts.append(f"- 主要发现：{'；'.join(findings)}")
+  conclusion = sanitize_unicode(analysis.get("conclusion", "")).strip()
+  if conclusion:
+    parts.append(f"- 结论：{conclusion}")
+  limitations = [str(l) for l in (analysis.get("limitations", []) or [])]
+  if limitations:
+    parts.append(f"- 局限与不足：{'；'.join(limitations)}")
+  templates = analysis.get("citation_templates", []) or []
+  zh_tpl = "".join(str(t.get("zh", "")) for t in templates if t.get("zh"))
+  if zh_tpl:
+    parts.append(f"- 可用引用句式：{zh_tpl}")
+
+  return "\n".join(parts)
+
+
+def build_literature_review_context(
+  workspace_id: str,
+  literature_ids: list[str],
+  topic: str,
+  mode: DataSourceMode,
+) -> str:
+  """构建注入文献综述 Agent 的上下文：按综述写作要求提供选定文献的分析素材与引用清单。"""
+  literatures = literature_store.get_literatures_by_ids(workspace_id, literature_ids)
+  entries = [
+    _format_literature_review_entry(idx, lit)
+    for idx, lit in enumerate(literatures, 1)
+  ]
+  literature_context = "\n\n".join(entries) if entries else "（无可用文献，请先在文献助手完成文献选定）"
+  return LITERATURE_REVIEW_CONTEXT_PROMPT.format(
+    topic=sanitize_unicode(topic),
+    literature_context=sanitize_unicode(literature_context),
     mode_description=MODE_DESCRIPTIONS.get(mode, MODE_DESCRIPTIONS["library_first"]),
   )
 

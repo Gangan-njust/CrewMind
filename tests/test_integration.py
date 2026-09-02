@@ -5,6 +5,7 @@ from datetime import datetime
 import pytest
 
 from backend.literature.integration import (
+  build_literature_review_context,
   build_proposal_context,
   extract_citation_markers,
   generate_reference_list,
@@ -73,6 +74,16 @@ def test_build_proposal_context(workspace_with_literature):
   ctx = build_proposal_context(ws_id, lit_ids, "深度学习研究", "library_first")
   assert "优先引用" in ctx
   assert "Deep Learning Survey" in ctx
+
+
+def test_build_literature_review_context(workspace_with_literature):
+  ws_id, lit_ids = workspace_with_literature
+  ctx = build_literature_review_context(ws_id, lit_ids, "深度学习研究现状综述", "only_library")
+  assert "文献综述" in ctx
+  assert "Deep Learning Survey" in ctx
+  assert "参考著录" in ctx
+  assert "[1]" in ctx
+  assert "综述主题" in ctx
 
 
 def test_generate_reference_list(workspace_with_literature):

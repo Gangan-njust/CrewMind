@@ -7,6 +7,7 @@ from backend.llm.client import llm_client
 from backend.writing.prompts import (
   COHERENCE_CHECK_PROMPT,
   EXPAND_PROMPT,
+  FIGURE_CHECK_PROMPT,
   POLISH_PROMPT,
   STRUCTURED_EXPAND_PROMPT,
   STRUCTURED_POLISH_PROMPT,
@@ -15,6 +16,7 @@ from backend.writing.prompts import (
   get_section_label,
 )
 from backend.writing.templates import is_abstract_section
+from backend.writing.figure_hints import scan_project_figure_hints
 
 logger = logging.getLogger(__name__)
 
@@ -478,3 +480,185 @@ def clean_blank_lines(text: str) -> dict:
     "summary": summary,
     "changed": changed,
   }
+
+
+# ── 图表完整性检查 ───────────────────────────────────────────
+
+_VALID_CHART_TYPES = frozenset({
+  "柱状图", "折线图", "散点图", "箱线图", "直方图", "流程图", "结构图", "表格", "示意图",
+})
+
+
+def _section_anchor_block(sections: list[dict]) -> str:
+  """把各章节正文组装为带章节标签的文本（供 LLM 检查）。"""
+  parts: list[str] = []
+  for sec in sections:
+    content = (sec.get("content") or "").strip()
+    if not content:
+      continue
+    label = get_section_label(sec.get("section_type", ""))
+    parts.append(f"## {label}（{sec.get('section_type', '')}）\n{content[:4000]}")
+  return "\n\n".join(parts)
+
+
+def _compact(text: str) -> str:
+  return re.sub(r"\s+", "", text or "")
+
+
+def _find_line_for_anchor(content: str, anchor: str) -> int | None:
+  """在章节正文中定位锚点句的行号（1 基）。"""
+  needle = _compact(anchor)
+  if not needle:
+    return None
+  lines = content.split("\n")
+  for idx, raw in enumerate(lines):
+    if needle in _compact(raw):
+      return idx + 1
+  # 退而求其次：锚点前 12 个有效字符匹配到某行
+  prefix = needle[:12]
+  if prefix:
+    for idx, raw in enumerate(lines):
+      if prefix in _compact(raw):
+        return idx + 1
+  return None
+
+
+def _normalize_chart_type(raw: str | None) -> str:
+  value = str(raw or "").strip()
+  return value if value in _VALID_CHART_TYPES else "图表"
+
+
+def _normalize_severity(raw: str | None) -> str:
+  value = str(raw or "").strip().lower()
+  return value if value in ("high", "medium", "low") else "medium"
+
+
+def _normalize_llm_issues(project: dict, raw_issues: list | None) -> list[dict]:
+  """把 LLM 返回的 issue 定位到具体章节与行号，无法锚定的丢弃。"""
+  if not raw_issues:
+    return []
+  sections = project.get("sections", [])
+  issues: list[dict] = []
+  seen: set[str] = set()
+  for issue in raw_issues:
+    if not isinstance(issue, dict):
+      continue
+    st = str(issue.get("section_type", "")).strip()
+    anchor = str(issue.get("anchor_text", "")).strip()
+    if not anchor:
+      continue
+    target_sections = [s for s in sections if s.get("section_type") == st and (s.get("content") or "").strip()]
+    if not target_sections:
+      target_sections = [s for s in sections if (s.get("content") or "").strip()]
+      if not target_sections:
+        continue
+      st = target_sections[0].get("section_type", "")
+    matched: tuple[dict, int] | None = None
+    for sec in target_sections:
+      line = _find_line_for_anchor(sec.get("content", ""), anchor)
+      if line is not None:
+        matched = (sec, line)
+        break
+    if not matched:
+      continue
+    sec, line = matched
+    chart_type = _normalize_chart_type(issue.get("chart_type"))
+    key = f"{sec.get('id', '')}:{line}:{chart_type}"
+    if key in seen:
+      continue
+    seen.add(key)
+    issues.append({
+      "section_id": sec.get("id", ""),
+      "section_type": st,
+      "display_title": sec.get("display_title", sec.get("title", ""))
+      or get_section_label(st),
+      "line": line,
+      "anchor_text": _compact(anchor)[:120],
+      "chart_type": chart_type,
+      "reason": str(issue.get("reason", "")).strip() or "按学术规范此处应配图表",
+      "suggestion": str(issue.get("suggestion", "")).strip() or "建议插入对应图表并补充图注与编号。",
+      "severity": _normalize_severity(issue.get("severity")),
+      "key": key,
+    })
+  return issues
+
+
+async def check_figures(project: dict, *, use_llm: bool = True) -> dict:
+  """图表完整性检查：规则预检 + LLM 语义细化（use_llm=False 时仅规则）。
+
+  返回与 scan_project_figure_hints 兼容的 payload，并附 used_llm / llm_issue_count。
+  LLM 不可用时自动降级为规则结果。
+  """
+  rule_report = scan_project_figure_hints(project)
+  sections = sorted(
+    project.get("sections", []),
+    key=lambda s: (s.get("sort_order", 0) if s.get("sort_order") is not None else 999,),
+  )
+  rule_issues = rule_report.get("issues", [])
+  summary = str(rule_report.get("summary", ""))
+  used_llm = False
+
+  llm_issues: list[dict] = []
+  if use_llm:
+    full_text = _section_anchor_block(sections)
+    if full_text.strip():
+      candidates_preview = [
+        {
+          "section_type": i.get("section_type", ""),
+          "line": i.get("line", 0),
+          "anchor_text": i.get("anchor_text", ""),
+          "chart_type": i.get("chart_type", ""),
+        }
+        for i in rule_issues[:10]
+      ]
+      prompt = FIGURE_CHECK_PROMPT.format(
+        full_text=full_text[:16000],
+        candidates=json.dumps(candidates_preview, ensure_ascii=False) or "（无）",
+      )
+      try:
+        data = await _llm_json(prompt)
+        llm_issues = _normalize_llm_issues(project, data.get("issues") if isinstance(data, dict) else None)
+        llm_summary = str((data or {}).get("summary", "")).strip()
+        used_llm = True
+        if llm_summary:
+          summary = llm_summary
+      except Exception as e:
+        logger.error("图表完整性 LLM 检查失败，降级为规则结果: %s", e)
+
+  # 合并：LLM 结果优先，规则结果中未被 LLM 覆盖的补充进去
+  merged: list[dict] = list(llm_issues)
+  covered_rule_indices: list[int] = []
+  for idx, rule in enumerate(rule_issues):
+    rule_sec = rule.get("section_id", "")
+    rule_line = rule.get("line", 0)
+    rule_compact = _compact(rule.get("anchor_text", ""))
+    covered = False
+    for llm in llm_issues:
+      if llm.get("section_id") != rule_sec:
+        continue
+      if abs(int(llm.get("line", 0)) - int(rule_line)) <= 2:
+        covered = True
+        break
+      llm_compact = _compact(llm.get("anchor_text", ""))
+      if rule_compact and llm_compact and (
+        rule_compact[:12] in llm_compact or llm_compact[:12] in rule_compact
+      ):
+        covered = True
+        break
+    if covered:
+      covered_rule_indices.append(idx)
+  for idx, rule in enumerate(rule_issues):
+    if idx not in covered_rule_indices:
+      merged.append(rule)
+
+  issue_count = len(merged)
+  return {
+    "issues": merged,
+    "figure_count": rule_report.get("figure_count", 0),
+    "table_count": rule_report.get("table_count", 0),
+    "section_count": rule_report.get("section_count", 0),
+    "summary": summary or f"全文共发现 {issue_count} 处建议配图位置。",
+    "used_llm": used_llm,
+    "llm_issue_count": len(llm_issues),
+  }
+

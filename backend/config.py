@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     uploads_dir: Path = Path("./data/uploads")
     literature_dir: Path = Path("./data/literature")
     experiment_dir: Path = Path("./data/experiments")
+    writing_dir: Path = Path("./data/writing")
     database_url: str = ""
     literature_analysis_concurrency: int = 3
     crew_task_concurrency: int = 3
@@ -88,6 +89,7 @@ class Settings(BaseSettings):
         (PROJECT_ROOT / self.uploads_dir).mkdir(parents=True, exist_ok=True)
         (PROJECT_ROOT / self.literature_dir).mkdir(parents=True, exist_ok=True)
         (PROJECT_ROOT / self.experiment_dir).mkdir(parents=True, exist_ok=True)
+        (PROJECT_ROOT / self.writing_dir).mkdir(parents=True, exist_ok=True)
         (PROJECT_ROOT / self.rag_dir).mkdir(parents=True, exist_ok=True)
 
 

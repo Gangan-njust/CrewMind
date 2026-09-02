@@ -9,7 +9,7 @@ import {
   fetchLiteratures, uploadLiteratures, deleteLiterature,
   analyzeLiteratures, filterLiteratures, selectLiteratures,
   fetchSelectedLiteratures, saveSelectionTemplate,
-  connectLiteratureWebSocket, startProposalFromLiterature,
+  connectLiteratureWebSocket, startProposalFromLiterature, startLiteratureReviewFromLiterature,
   updateLiteratureAnalysis, fetchAgents, fetchScenarios,
   reindexLiterature, ragQuery, literatureImageUrl,
   type Workspace, type Literature, type AnalysisProgress, type DataSourceMode,
@@ -32,8 +32,9 @@ const INDEX_STATUS_LABELS: Record<string, string> = {
 }
 
 const PROPOSAL_SCENARIO_ID = 'literature_based_proposal'
+const LITERATURE_REVIEW_SCENARIO_ID = 'literature_based_review'
 
-function defaultProposalAgents(scenario: Scenario | null, agents: Agent[]): string[] {
+function defaultScenarioAgents(scenario: Scenario | null, agents: Agent[]): string[] {
   if (!scenario) return []
   const inScenario = new Set(scenario.agents.map(a => a.id))
   return agents
@@ -60,8 +61,14 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
   const [detailLit, setDetailLit] = useState<Literature | null>(null)
   const [showCreateWs, setShowCreateWs] = useState(false)
   const [showProposal, setShowProposal] = useState(false)
+  const [showReview, setShowReview] = useState(false)
   const [wsForm, setWsForm] = useState({ name: '', description: '' })
   const [proposalForm, setProposalForm] = useState({
+    mode: 'library_first' as DataSourceMode,
+    topic: '',
+    additional: '',
+  })
+  const [reviewForm, setReviewForm] = useState({
     mode: 'library_first' as DataSourceMode,
     topic: '',
     additional: '',
@@ -69,6 +76,8 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
   const [agents, setAgents] = useState<Agent[]>([])
   const [proposalScenario, setProposalScenario] = useState<Scenario | null>(null)
   const [proposalSelectedAgents, setProposalSelectedAgents] = useState<string[]>([])
+  const [reviewScenario, setReviewScenario] = useState<Scenario | null>(null)
+  const [reviewSelectedAgents, setReviewSelectedAgents] = useState<string[]>([])
   const [error, setError] = useState('')
   const [dragOver, setDragOver] = useState(false)
   const [toast, setToast] = useState('')
@@ -142,9 +151,14 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
     if (!activeWorkspace) return
     fetchAgents().then(setAgents).catch(() => {})
     fetchScenarios()
-      .then(scenarios => setProposalScenario(
-        scenarios.find(s => s.id === PROPOSAL_SCENARIO_ID) || null
-      ))
+      .then(scenarios => {
+        setProposalScenario(
+          scenarios.find(s => s.id === PROPOSAL_SCENARIO_ID) || null
+        )
+        setReviewScenario(
+          scenarios.find(s => s.id === LITERATURE_REVIEW_SCENARIO_ID) || null
+        )
+      })
       .catch(() => {})
   }, [activeWorkspace])
 
@@ -160,12 +174,13 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
         if (lightboxSrc) setLightboxSrc(null)
         else if (detailLit) setDetailLit(null)
         else if (showProposal) setShowProposal(false)
+        else if (showReview) setShowReview(false)
         else if (showCreateWs) setShowCreateWs(false)
       }
     }
     document.addEventListener('keydown', handleKeyDown)
     return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [lightboxSrc, detailLit, showProposal, showCreateWs])
+  }, [lightboxSrc, detailLit, showProposal, showReview, showCreateWs])
 
   const handleCreateWorkspace = async () => {
     if (!wsForm.name.trim()) return
@@ -244,8 +259,21 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
   const proposalScenarioAgentIds = new Set(proposalScenario?.agents.map(a => a.id) || [])
   const canStartProposal = proposalSelectedAgents.length > 0 && selectedIds.length > 0 && proposalTopicValid
 
+  const reviewTopic = (reviewForm.topic || activeWorkspace?.name || '').trim()
+  const reviewTopicValid = reviewTopic.length >= 5
+  const reviewScenarioAgentIds = new Set(reviewScenario?.agents.map(a => a.id) || [])
+  const canStartReview = reviewSelectedAgents.length > 0 && selectedIds.length > 0 && reviewTopicValid
+
   const toggleProposalAgent = (agentId: string) => {
     setProposalSelectedAgents(prev =>
+      prev.includes(agentId)
+        ? prev.filter(id => id !== agentId)
+        : [...prev, agentId]
+    )
+  }
+
+  const toggleReviewAgent = (agentId: string) => {
+    setReviewSelectedAgents(prev =>
       prev.includes(agentId)
         ? prev.filter(id => id !== agentId)
         : [...prev, agentId]
@@ -272,6 +300,29 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
       onStartWorkflow(res.crew_id)
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : '启动开题报告生成失败')
+    }
+  }
+
+  const handleLiteratureReview = async () => {
+    if (!activeWorkspace || !canStartReview) return
+    if (!reviewTopicValid) {
+      setError('综述主题至少需要 5 个字符，请填写完整后再提交')
+      return
+    }
+    setError('')
+    try {
+      const res = await startLiteratureReviewFromLiterature({
+        workspace_id: activeWorkspace.id,
+        literature_ids: selectedIds,
+        mode: reviewForm.mode,
+        topic: reviewTopic,
+        additional_requirements: reviewForm.additional.trim(),
+        selected_agents: reviewSelectedAgents,
+      })
+      setShowReview(false)
+      onStartWorkflow(res.crew_id)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '启动文献综述生成失败')
     }
   }
 
@@ -358,11 +409,32 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
         scenario = scenarios.find(s => s.id === PROPOSAL_SCENARIO_ID) || null
         setProposalScenario(scenario)
       }
-      setProposalSelectedAgents(defaultProposalAgents(scenario, agentList))
+      setProposalSelectedAgents(defaultScenarioAgents(scenario, agentList))
     } catch {
       setProposalSelectedAgents([])
     }
     setShowProposal(true)
+  }
+
+  const openLiteratureReviewModal = async () => {
+    setReviewForm(f => ({ ...f, topic: activeWorkspace?.name || '' }))
+    try {
+      let agentList = agents
+      let scenario = reviewScenario
+      if (!agentList.length) {
+        agentList = await fetchAgents()
+        setAgents(agentList)
+      }
+      if (!scenario) {
+        const scenarios = await fetchScenarios()
+        scenario = scenarios.find(s => s.id === LITERATURE_REVIEW_SCENARIO_ID) || null
+        setReviewScenario(scenario)
+      }
+      setReviewSelectedAgents(defaultScenarioAgents(scenario, agentList))
+    } catch {
+      setReviewSelectedAgents([])
+    }
+    setShowReview(true)
   }
 
   const renderInlineImages = (lit: Literature, sections: string[]) => {
@@ -761,6 +833,14 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
               <button className="btn btn-sm btn-primary" disabled={!selectedIds.length} onClick={openProposalModal}>
                 <Sparkles size={14} /> 生成开题报告
               </button>
+              <button
+                className="btn btn-sm btn-primary"
+                disabled={!selectedIds.length}
+                onClick={openLiteratureReviewModal}
+                title="基于选定文献按综述规范生成系统性文献综述"
+              >
+                <BookOpen size={14} /> 生成文献综述
+              </button>
               {onStartWriting && activeWorkspace && (
                 <button
                   className="btn btn-sm btn-outline"
@@ -964,6 +1044,105 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
                 <Sparkles size={16} /> 确认并启动工作流
               </button>
               <button className="btn btn-outline" onClick={() => setShowProposal(false)}>取消</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 文献综述配置对话框 */}
+      {showReview && (
+        <div className="modal-overlay" onClick={() => setShowReview(false)}>
+          <div className="modal-card modal-wide" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>基于文献生成文献综述</h3>
+              <button className="icon-btn" onClick={() => setShowReview(false)}><X size={18} /></button>
+            </div>
+            <div className="form-group">
+              <label className="form-label">协作角色</label>
+              <p className="form-hint">勾选参与文献综述生成的 Agent。取消某角色将跳过其对应任务。</p>
+              <div className="agent-select-grid proposal-agent-grid">
+                {agents.map(agent => {
+                  const inScenario = reviewScenarioAgentIds.has(agent.id)
+                  const checked = reviewSelectedAgents.includes(agent.id)
+                  return (
+                    <label
+                      key={agent.id}
+                      className={`agent-select-card ${checked ? 'selected' : ''} ${!inScenario ? 'extra' : ''}`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleReviewAgent(agent.id)}
+                      />
+                      <div className="agent-select-info">
+                        <div className="agent-select-name">
+                          {agent.name}
+                          {agent.is_builtin && agent.category === 'domain_review' && (
+                            <span className="domain-badge">领域审稿</span>
+                          )}
+                          {agent.is_builtin && agent.category !== 'domain_review' && (
+                            <span className="builtin-badge">内置</span>
+                          )}
+                          {!agent.is_builtin && <span className="custom-badge">自定义</span>}
+                          {!inScenario && checked && <span className="extra-badge">额外加入</span>}
+                        </div>
+                        <div className="agent-select-title">{agent.title}</div>
+                      </div>
+                    </label>
+                  )
+                })}
+              </div>
+              {reviewSelectedAgents.length === 0 && (
+                <p className="form-hint" style={{ color: 'var(--warning)' }}>请至少选择一个协作角色</p>
+              )}
+            </div>
+            <div className="form-group">
+              <label className="form-label">数据源权重</label>
+              {([
+                ['only_library', '仅使用选定文献'],
+                ['library_first', '文献为主，网络检索为辅'],
+                ['web_first', '网络检索为主，文献为辅'],
+              ] as const).map(([val, label]) => (
+                <label key={val} className="radio-label">
+                  <input type="radio" name="review-mode" value={val}
+                    checked={reviewForm.mode === val}
+                    onChange={() => setReviewForm(f => ({ ...f, mode: val }))} />
+                  {label}
+                </label>
+              ))}
+            </div>
+            <div className="form-group">
+              <label className="form-label">综述主题</label>
+              <input
+                className="form-input"
+                value={reviewForm.topic}
+                onChange={e => setReviewForm(f => ({ ...f, topic: e.target.value }))}
+                placeholder={activeWorkspace?.name || '请输入综述主题（至少 5 个字符）'}
+                minLength={5}
+                required
+              />
+              {!reviewTopicValid && (
+                <p className="form-hint" style={{ color: 'var(--warning)' }}>
+                  主题过短（当前 {reviewTopic.length} 字），请至少输入 5 个字符
+                </p>
+              )}
+            </div>
+            <div className="form-group">
+              <label className="form-label">补充要求</label>
+              <textarea className="form-textarea" value={reviewForm.additional} rows={3}
+                onChange={e => setReviewForm(f => ({ ...f, additional: e.target.value }))}
+                placeholder="可选：对综述结构（如按主题/发展脉络组织）、篇幅、侧重点等的额外要求" />
+            </div>
+            <p className="form-hint">将使用 {selectedIds.length} 篇选定文献，按学术综述规范生成</p>
+            <div className="form-actions">
+              <button
+                className="btn btn-primary"
+                onClick={handleLiteratureReview}
+                disabled={!canStartReview}
+              >
+                <BookOpen size={16} /> 确认并启动工作流
+              </button>
+              <button className="btn btn-outline" onClick={() => setShowReview(false)}>取消</button>
             </div>
           </div>
         </div>

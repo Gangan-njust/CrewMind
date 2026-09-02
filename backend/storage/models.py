@@ -258,6 +258,28 @@ class WritingReferenceRecord(Base):
   position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
+class WritingAssetRecord(Base):
+  """写作项目内嵌图表素材（图片文件实体）。
+
+  正文以 `![图注](cmasset://{asset_id})` 引用；
+  kind 说明来源：experiment_chart / experiment_metric / experiment_attachment /
+  literature_image / upload。
+  """
+
+  __tablename__ = "writing_assets"
+
+  id: Mapped[str] = mapped_column(String(36), primary_key=True)
+  project_id: Mapped[str] = mapped_column(
+    String(36), ForeignKey("writing_projects.id"), index=True, nullable=False
+  )
+  kind: Mapped[str] = mapped_column(String(32), nullable=False, default="upload")
+  filename: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+  file_path: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+  caption: Mapped[str] = mapped_column(Text, nullable=False, default="")
+  source_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+  created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 class ExperimentRecord(Base):
   __tablename__ = "experiments"
 

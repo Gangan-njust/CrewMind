@@ -37,6 +37,16 @@ PROPOSAL_SECTION_PATTERNS = (
   r"整合(?:后的)?(?:完整)?(?:开题报告|工作方案|方案)",
   r"完整工作方案",
 )
+REVIEW_SCENARIOS = frozenset({"literature_review", "literature_based_review"})
+REVIEW_DOC_SECTION_PATTERNS = (
+  r"完整文献综述\s*[（(]整合版[）)]",
+  r"文献综述\s*[（(]完整版[）)]",
+  r"完整文献综述",
+)
+# 综述成文中属于“过程/工具性说明”的章节：导出纯综述时剔除
+REVIEW_PROCESS_HEADING_KEYWORDS = (
+  "检索", "筛选", "数据库", "纳入标准",
+)
 REVIEW_REPORT_MARKERS = (
   "终审报告", "质量评估", "主要优点", "存在问题", "改进建议", "录用建议",
 )
@@ -59,7 +69,7 @@ def _looks_like_proposal_document(text: str) -> bool:
 def _extract_markdown_section(text: str, heading_patterns: tuple[str, ...]) -> str | None:
   for pattern in heading_patterns:
     match = re.search(
-      rf"^(#{{1,3}})\s*(?:\d+\.\s*)?(?:{pattern})\s*$",
+      rf"^(#{{1,3}})\s*(?:\d+\s*[.、]?\s*)?(?:{pattern})\s*$",
       text,
       re.MULTILINE,
     )
@@ -120,6 +130,75 @@ def extract_proposal_output(
   if review_output and not _looks_like_review_report(review_output):
     return review_output
   return None
+
+
+def _looks_like_review_document(text: str) -> bool:
+  """判断文本是否为综述成文正文（而非终审/评审意见）。"""
+  head = text[:800].strip()
+  if _looks_like_review_report(text):
+    return False
+  return any(marker in head for marker in ("# 文献综述", "完整文献综述", "# 综述"))
+
+
+def _strip_review_process_sections(md: str) -> str:
+  """去掉综述正文中属于“过程/工具性说明”的章节（如检索说明、筛选标准、数据库说明）。"""
+  lines = md.splitlines()
+  out: list[str] = []
+  skip_depth: int | None = None
+  for line in lines:
+    m = re.match(r"^(#{1,6})\s+(.*)$", line)
+    if m:
+      level = len(m.group(1))
+      title = m.group(2).strip()
+      if skip_depth is not None and level <= skip_depth:
+        skip_depth = None
+      if skip_depth is None and any(k in title for k in REVIEW_PROCESS_HEADING_KEYWORDS):
+        skip_depth = level
+        continue
+    if skip_depth is not None:
+      continue
+    out.append(line)
+  return "\n".join(out).strip()
+
+
+def extract_pure_output(
+  tasks: dict,
+  scenario: str,
+  task_order: list[str] | None = None,
+) -> str | None:
+  """提取“纯综述/纯文章”正文：只取最终整合成果，不含规划稿、审稿意见、检索说明等过程。"""
+  order = task_order or []
+  if not order:
+    try:
+      order = [t.id for t in TASK_FLOWS[ScenarioType(scenario)]]
+    except (ValueError, KeyError):
+      order = list(tasks.keys())
+
+  if scenario in REVIEW_SCENARIOS:
+    review_task = tasks.get(PROPOSAL_TASK_ID) or {}
+    review_output = (review_task.get("output") or "").strip()
+    lit_task = tasks.get("task_literature") or {}
+    lit_output = (lit_task.get("output") or "").strip()
+
+    # 1) 终审任务本身已是综述正文 → 直接使用
+    if review_output and _looks_like_review_document(review_output):
+      return _strip_review_process_sections(review_output)
+    # 2) 终审报告内嵌“完整文献综述（整合版）” → 抽取该节
+    if review_output:
+      section = _extract_markdown_section(review_output, REVIEW_DOC_SECTION_PATTERNS)
+      if section:
+        return _strip_review_process_sections(section)
+    # 3) 综述撰写任务的成文正文
+    if lit_output:
+      return _strip_review_process_sections(lit_output)
+    # 4) 回退：去掉终审/学科审稿后的任务拼装
+    composed = _compose_proposal_from_tasks(tasks, order)
+    if composed:
+      return composed
+    return None
+
+  # 其余场景：与“仅开题报告”一致，返回最终整合正文
+  return extract_proposal_output(tasks, scenario, order)
 
 TITLE_MAX_LENGTH = 80
 
@@ -870,6 +949,91 @@ class ResultStore:
     ]
     return "\n".join(sections)
 
+  def build_pure_markdown(self, record: dict) -> str:
+    """导出纯综述/纯文章 Markdown：仅含最终整合正文，不含分析过程。"""
+    output = extract_pure_output(
+      record.get("tasks", {}),
+      record.get("scenario", ""),
+    )
+    if not output:
+      raise ValueError("未找到纯正文内容，请确认对应任务已完成")
+    return output.rstrip() + "\n"
+
+  def build_pure_markdown_from_workflow(
+    self,
+    scenario: str,
+    user_input: str,
+    results: dict,
+    task_order: list[str] | None = None,
+  ) -> str:
+    output = extract_pure_output(results, scenario, task_order)
+    if not output:
+      raise ValueError("未找到纯正文内容，请确认对应任务已完成")
+    return output.rstrip() + "\n"
+
+  def build_pure_latex(self, record: dict) -> str:
+    output = extract_pure_output(
+      record.get("tasks", {}),
+      record.get("scenario", ""),
+    )
+    if not output:
+      raise ValueError("未找到纯正文内容，请确认对应任务已完成")
+    title = record.get("title") or "纯综述/纯文章"
+    sections: list[str] = [
+      r"\documentclass[UTF8]{ctexart}",
+      r"\usepackage{hyperref}",
+      r"\usepackage{geometry}",
+      r"\geometry{a4paper, margin=2.5cm}",
+      r"\usepackage{verbatim}",
+      r"\usepackage{enumitem}",
+      "",
+      rf"\title{{{_escape_latex(title)}}}",
+      r"\date{}",
+      "",
+      r"\begin{document}",
+      r"\maketitle",
+      "",
+      _markdown_to_latex(output),
+      "",
+      r"\end{document}",
+      "",
+    ]
+    return "\n".join(sections)
+
+  def build_pure_latex_from_workflow(
+    self,
+    scenario: str,
+    user_input: str,
+    results: dict,
+    title: str | None = None,
+    task_order: list[str] | None = None,
+  ) -> str:
+    output = extract_pure_output(results, scenario, task_order)
+    if not output:
+      raise ValueError("未找到纯正文内容，请确认对应任务已完成")
+    doc_title = title or "纯综述/纯文章"
+    sections: list[str] = [
+      r"\documentclass[UTF8]{ctexart}",
+      r"\usepackage{hyperref}",
+      r"\usepackage{geometry}",
+      r"\geometry{a4paper, margin=2.5cm}",
+      r"\usepackage{verbatim}",
+      r"\usepackage{enumitem}",
+      "",
+      rf"\title{{{_escape_latex(doc_title)}}}",
+      r"\date{}",
+      "",
+      r"\begin{document}",
+      r"\maketitle",
+      "",
+      _markdown_to_latex(output),
+      "",
+      r"\end{document}",
+      "",
+    ]
+    return "\n".join(sections)
+
+
   def build_docx(self, md_content: str, *, first_line_indent: bool = False) -> bytes:
     html = markdown.markdown(
       md_content,
@@ -891,7 +1055,12 @@ class ResultStore:
     scenario_label, _ = self._resolve_scenario_meta(scenario)
     safe_label = "".join(c if c.isalnum() or c in "._-" else "_" for c in scenario_label)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    prefix = "开题报告" if scope == "proposal" else "工作方案"
+    if scope == "proposal":
+      prefix = "开题报告"
+    elif scope in ("pure", "clean"):
+      prefix = "纯综述" if "review" in scenario else "纯文章"
+    else:
+      prefix = "工作方案"
     return f"{prefix}_{safe_label}_{timestamp}.{ext}"
 
   def _migrate_legacy_files(self) -> None:

@@ -661,7 +661,7 @@ async def get_result(record_id: str, current_user: User = Depends(get_current_us
 async def export_result(
   record_id: str,
   format: str = Query("md", pattern="^(md|docx|tex)$"),
-  scope: str = Query("full", pattern="^(full|proposal)$"),
+  scope: str = Query("full", pattern="^(full|proposal|pure)$"),
   current_user: User = Depends(get_current_user),
 ):
   record = result_store.get(record_id, current_user.id)
@@ -671,22 +671,30 @@ async def export_result(
   filename = result_store.export_filename(record["scenario"], format, scope)
 
   try:
-    if scope == "proposal":
+    if scope in ("proposal", "pure"):
+      use_pure = scope == "pure"
+      md_content = (
+        result_store.build_pure_markdown(record)
+        if use_pure
+        else result_store.build_proposal_markdown(record)
+      )
       if format == "md":
-        content = result_store.build_proposal_markdown(record)
         return Response(
-          content=content.encode("utf-8"),
+          content=md_content.encode("utf-8"),
           media_type="text/markdown; charset=utf-8",
           headers=_attachment_headers(filename),
         )
       if format == "tex":
-        content = result_store.build_proposal_latex(record)
+        content = (
+          result_store.build_pure_latex(record)
+          if use_pure
+          else result_store.build_proposal_latex(record)
+        )
         return Response(
           content=content.encode("utf-8"),
           media_type="application/x-tex; charset=utf-8",
           headers=_attachment_headers(filename),
         )
-      md_content = result_store.build_proposal_markdown(record)
       docx_bytes = result_store.build_docx(md_content)
       return Response(
         content=docx_bytes,
@@ -725,7 +733,7 @@ async def export_result(
 async def export_workflow(
   crew_id: str,
   format: str = Query("md", pattern="^(md|docx|tex)$"),
-  scope: str = Query("full", pattern="^(full|proposal)$"),
+  scope: str = Query("full", pattern="^(full|proposal|pure)$"),
   current_user: User = Depends(get_current_user),
 ):
   crew = workflow_manager.get_crew(crew_id, current_user.id)
@@ -739,37 +747,50 @@ async def export_workflow(
   task_order = [t.id for t in crew.tasks]
 
   try:
-    if scope == "proposal":
-      if format == "md":
-        content = result_store.build_proposal_markdown_from_workflow(
+    if scope in ("proposal", "pure"):
+      use_pure = scope == "pure"
+      md_content = (
+        result_store.build_pure_markdown_from_workflow(
           scenario=crew.scenario,
           user_input=crew.user_input,
           results=results,
           task_order=task_order,
         )
+        if use_pure
+        else result_store.build_proposal_markdown_from_workflow(
+          scenario=crew.scenario,
+          user_input=crew.user_input,
+          results=results,
+          task_order=task_order,
+        )
+      )
+      if format == "md":
         return Response(
-          content=content.encode("utf-8"),
+          content=md_content.encode("utf-8"),
           media_type="text/markdown; charset=utf-8",
           headers=_attachment_headers(filename),
         )
       if format == "tex":
-        content = result_store.build_proposal_latex_from_workflow(
-          scenario=crew.scenario,
-          user_input=crew.user_input,
-          results=results,
-          task_order=task_order,
+        content = (
+          result_store.build_pure_latex_from_workflow(
+            scenario=crew.scenario,
+            user_input=crew.user_input,
+            results=results,
+            task_order=task_order,
+          )
+          if use_pure
+          else result_store.build_proposal_latex_from_workflow(
+            scenario=crew.scenario,
+            user_input=crew.user_input,
+            results=results,
+            task_order=task_order,
+          )
         )
         return Response(
           content=content.encode("utf-8"),
           media_type="application/x-tex; charset=utf-8",
           headers=_attachment_headers(filename),
         )
-      md_content = result_store.build_proposal_markdown_from_workflow(
-        scenario=crew.scenario,
-        user_input=crew.user_input,
-        results=results,
-        task_order=task_order,
-      )
       docx_bytes = result_store.build_docx(md_content)
       return Response(
         content=docx_bytes,
@@ -827,6 +848,7 @@ async def compare_results(req: CompareRequest, current_user: User = Depends(get_
 # ── 智能文献阅读助手 API ───────────────────────────────────────
 
 from backend.routes.literature import (
+  register_literature_review_route,
   register_literature_websocket,
   register_proposal_route,
   router as literature_router,
@@ -834,6 +856,7 @@ from backend.routes.literature import (
 
 app.include_router(literature_router)
 register_proposal_route(app, workflow_manager, ws_manager, _attach_event_callback, _finalize_crew)
+register_literature_review_route(app, workflow_manager, ws_manager, _attach_event_callback, _finalize_crew)
 register_literature_websocket(app)
 
 from backend.routes.writing import router as writing_router

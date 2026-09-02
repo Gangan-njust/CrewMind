@@ -438,7 +438,7 @@ export async function downloadExport(options: {
   format: 'md' | 'docx' | 'tex'
   recordId?: string
   crewId?: string
-  scope?: 'full' | 'proposal'
+  scope?: 'full' | 'proposal' | 'pure'
 }) {
   const { format, recordId, crewId, scope = 'full' } = options
   if (!recordId && !crewId) {
@@ -927,6 +927,34 @@ export async function startProposalFromLiterature(data: {
   }>
 }
 
+export async function startLiteratureReviewFromLiterature(data: {
+  workspace_id: string
+  literature_ids: string[]
+  mode: DataSourceMode
+  topic: string
+  additional_requirements?: string
+  selected_agents: string[]
+}) {
+  const res = await authFetch(`${API_BASE}/reports/literature-review/from-literature`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '启动文献综述生成失败'))
+  return res.json() as Promise<{
+    crew_id: string
+    status: string
+    scenario: string
+    tasks: Array<{
+      id: string
+      name: string
+      agent_id: string
+      depends_on: string[]
+      requires_human_review?: boolean
+    }>
+  }>
+}
+
 export function connectLiteratureWebSocket(
   workspaceId: string,
   onMessage: (data: AnalysisProgress & { type?: string }) => void,
@@ -1389,6 +1417,101 @@ export async function checkCitationCompleteness(projectId: string) {
   })
   if (!res.ok) throw new Error(await parseError(res, '引用完整性检查失败'))
   return res.json()
+}
+
+// ── 图表完整性提醒 / 图表素材 ─────────────────────────────
+
+export interface FigureHintItem {
+  section_id?: string
+  section_type?: string
+  display_title?: string
+  line: number
+  anchor_text?: string
+  chart_type: string
+  reason?: string
+  suggestion?: string
+  severity?: string
+  key?: string
+}
+
+export interface FigureCheckReport {
+  issues: FigureHintItem[]
+  figure_count: number
+  table_count: number
+  section_count: number
+  summary: string
+  used_llm?: boolean
+  llm_issue_count?: number
+}
+
+export async function checkFigures(
+  projectId: string,
+  useLlm = true,
+): Promise<FigureCheckReport> {
+  const res = await authFetch(`${API_BASE}/writing/check/figures`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId, use_llm: useLlm }),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '图表完整性检查失败'))
+  return res.json()
+}
+
+export async function checkFiguresSection(
+  text: string,
+  sectionType = 'intro',
+): Promise<FigureCheckReport> {
+  const res = await authFetch(`${API_BASE}/writing/check/figures/section`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, section_type: sectionType }),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '图表检查失败'))
+  return res.json()
+}
+
+export interface FigureAsset {
+  id: string
+  project_id: string
+  kind: string
+  filename: string
+  caption: string
+  source: Record<string, any>
+  created_at: string
+  markdown_ref: string
+}
+
+export interface FigureAssetRequest {
+  kind: string
+  caption?: string
+  source?: Record<string, any>
+  data_base64?: string
+}
+
+export async function fetchWritingFigureCandidates(projectId: string) {
+  const res = await authFetch(`${API_BASE}/writing/projects/${projectId}/figure-candidates`)
+  if (!res.ok) throw new Error(await parseError(res, '获取图表素材失败'))
+  return res.json()
+}
+
+export async function createWritingFigureAsset(
+  projectId: string,
+  data: FigureAssetRequest,
+): Promise<FigureAsset> {
+  const res = await authFetch(`${API_BASE}/writing/projects/${projectId}/assets`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) throw new Error(await parseError(res, '创建图表素材失败'))
+  return res.json()
+}
+
+export function writingAssetUrl(projectId: string, assetId: string): string {
+  const base = `${API_BASE}/writing/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`
+  const token = getToken()
+  if (!token) return base
+  return `${base}?token=${encodeURIComponent(token)}`
 }
 
 export async function fetchSectionVersions(sectionId: string): Promise<SectionVersion[]> {

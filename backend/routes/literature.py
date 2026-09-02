@@ -12,7 +12,7 @@ from backend.llm.client import set_llm_run_context
 from backend.literature.analyzer import analyze_batch, get_analysis_progress, identify_research_gaps
 from backend.literature.export import export_bibtex, export_endnote_xml, export_references
 from backend.literature.filter import filter_literatures, search_literatures
-from backend.literature.integration import build_proposal_context
+from backend.literature.integration import build_literature_review_context, build_proposal_context
 from backend.literature.selection import (
   clear_selection,
   get_selected_ids,
@@ -79,6 +79,15 @@ class ProposalFromLiteratureRequest(BaseModel):
   topic: str = Field(..., min_length=5)
   additional_requirements: str = ""
   selected_agents: list[str] = Field(default_factory=list, description="参与开题报告协作的 Agent 角色 ID")
+
+
+class ReviewFromLiteratureRequest(BaseModel):
+  workspace_id: str
+  literature_ids: list[str] = Field(..., min_length=1)
+  mode: str = Field("library_first", pattern="^(only_library|library_first|web_first)$")
+  topic: str = Field(..., min_length=5, description="文献综述主题")
+  additional_requirements: str = ""
+  selected_agents: list[str] = Field(default_factory=list, description="参与文献综述协作的 Agent 角色 ID")
 
 
 class RagSearchRequest(BaseModel):
@@ -692,6 +701,70 @@ def register_proposal_route(app, workflow_manager, ws_manager, attach_callback, 
         await finalize_crew(crew)
       except Exception as e:
         logger.exception("基于文献的开题报告生成失败")
+        await ws_manager.broadcast(crew.id, {"type": "crew_failed", "error": str(e)})
+
+    asyncio.create_task(run_crew())
+    from backend.tasks.filtering import serialize_tasks
+
+    return {
+      "crew_id": crew.id,
+      "status": "started",
+      "scenario": crew.scenario,
+      "tasks": serialize_tasks(crew.tasks),
+    }
+
+
+# ── 基于文献生成文献综述 ──────────────────────────────────────
+
+def register_literature_review_route(app, workflow_manager, ws_manager, attach_callback, finalize_crew):
+  """注册基于文献生成文献综述的路由（需 main.py 注入依赖）"""
+
+  @app.post("/api/reports/literature-review/from-literature")
+  async def literature_review_from_literature(
+    req: ReviewFromLiteratureRequest,
+    current_user: User = Depends(get_current_user),
+  ):
+    try:
+      literature_store._verify_workspace(req.workspace_id, current_user.id)
+    except ValueError as e:
+      raise HTTPException(404, str(e))
+
+    context = build_literature_review_context(
+      req.workspace_id, req.literature_ids, req.topic, req.mode  # type: ignore[arg-type]
+    )
+    user_input = sanitize_unicode(f"{req.topic}\n\n{context}")
+    if req.additional_requirements:
+      user_input += f"\n\n## 补充要求\n\n{sanitize_unicode(req.additional_requirements)}"
+
+    if req.mode == "only_library":
+      user_input += "\n\n**注意：仅使用用户文献库，禁止调用网络检索补充。**"
+    elif req.mode == "web_first":
+      user_input += "\n\n**注意：以网络检索为主，用户文献库为辅，须在文献数据库说明中区分来源。**"
+
+    if not req.selected_agents:
+      raise HTTPException(400, "请至少选择一个 Agent 角色")
+
+    from backend.agents.roles import ScenarioType
+
+    try:
+      crew = await workflow_manager.start_workflow(
+        scenario=ScenarioType.LITERATURE_BASED_REVIEW.value,
+        user_input=user_input,
+        user_id=current_user.id,
+        selected_agents=req.selected_agents,
+        workspace_id=req.workspace_id,
+      )
+    except ValueError as e:
+      raise HTTPException(400, str(e))
+    attach_callback(crew)
+    set_llm_run_context(user_id=current_user.id, run_id=crew.id, source="workflow")
+
+    async def run_crew():
+      try:
+        await crew.run()
+        await finalize_crew(crew)
+      except Exception as e:
+        logger.exception("基于文献的文献综述生成失败")
         await ws_manager.broadcast(crew.id, {"type": "crew_failed", "error": str(e)})
 
     asyncio.create_task(run_crew())

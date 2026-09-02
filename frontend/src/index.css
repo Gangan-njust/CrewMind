@@ -7348,3 +7348,226 @@ button.writing-subheading-tree-item.active {
   border-top: 1px dashed var(--border);
 }
 
+/* ── 图表完整性提醒 ─────────────────────────────────────── */
+
+.writing-section-figure-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.6;
+  color: var(--bg-primary);
+  background: var(--warning);
+  border-radius: 999px;
+}
+
+.writing-toolbar-figure-hint {
+  cursor: pointer;
+  color: var(--warning) !important;
+  font-weight: 600;
+}
+.writing-toolbar-figure-hint:hover {
+  text-decoration: underline;
+}
+
+.writing-figures-stats {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.writing-chip {
+  padding: 1px 8px;
+  font-size: 11px;
+  color: var(--bg-primary);
+  background: var(--accent);
+  border-radius: 999px;
+}
+
+.writing-figure-card {
+  margin-bottom: 10px;
+}
+.writing-figure-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.writing-figure-card-loc {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.writing-figure-anchor {
+  margin: 2px 0 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-hover);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+}
+.writing-figure-reason {
+  margin: 0 0 2px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+.writing-figure-suggestion {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.writing-figure-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.writing-candidates-picker {
+  margin-top: 8px;
+  padding: 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  max-height: 260px;
+  overflow-y: auto;
+}
+.writing-candidates-state {
+  margin-top: 8px;
+  padding: 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg-secondary);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+}
+.writing-candidates-error {
+  color: var(--danger);
+}
+.writing-candidates-group {
+  margin-bottom: 8px;
+}
+.writing-candidates-group h6 {
+  margin: 4px 0 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.writing-candidates-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.writing-candidates-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px;
+  border-top: 1px solid var(--border);
+}
+.writing-candidates-list li:first-child {
+  border-top: none;
+}
+.writing-candidate-thumb {
+  width: 44px;
+  height: 32px;
+  object-fit: cover;
+  flex: none;
+  border-radius: 4px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+}
+.writing-candidate-thumb-placeholder {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+}
+.writing-candidate-info {
+  flex: 1;
+  min-width: 0;
+}
+.writing-candidate-title {
+  display: block;
+  font-size: 12px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.writing-candidate-sub {
+  display: block;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 预览：待插入占位卡片 */
+.writing-figure-placeholder {
+  display: block;
+  margin: 10px 0;
+  padding: 12px 14px;
+  text-align: center;
+  color: var(--text-secondary);
+  background: repeating-linear-gradient(
+    -45deg,
+    var(--bg-hover),
+    var(--bg-hover) 8px,
+    var(--bg-secondary) 8px,
+    var(--bg-secondary) 16px
+  );
+  border: 2px dashed var(--warning);
+  border-radius: var(--radius);
+}
+.writing-figure-placeholder-title {
+  display: block;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.writing-figure-placeholder-hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+/* 预览：已嵌入真实图表 */
+.writing-figure-embedded {
+  margin: 10px 0;
+  text-align: center;
+}
+.writing-figure-embedded img {
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.writing-figure-embedded figcaption {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+/* 预览：LaTeX 公式（KaTeX） */
+.writing-preview.markdown-body .katex-display,
+.writing-full-preview-body.markdown-body .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 2px 0;
+  margin: 6px 0;
+}
+.writing-preview.markdown-body .katex,
+.writing-full-preview-body.markdown-body .katex {
+  font-size: 1.08em;
+}
+.writing-preview.markdown-body .math.math-display,
+.writing-full-preview-body.markdown-body .math.math-display {
+  text-align: center;
+}
+
+

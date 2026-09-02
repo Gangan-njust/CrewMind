@@ -3,11 +3,14 @@ import json
 import uuid
 from datetime import datetime
 from difflib import unified_diff
+from pathlib import Path
 
 from sqlalchemy import delete, select
 
+from backend.config import PROJECT_ROOT, settings
 from backend.storage.database import get_session
 from backend.storage.models import (
+  WritingAssetRecord,
   WritingProjectRecord,
   WritingReferenceRecord,
   WritingSectionRecord,
@@ -640,6 +643,116 @@ class WritingStore:
       project.updated_at = datetime.now()
       session.commit()
       return self.get_project(project_id, user_id)
+
+  # ── 图表素材（writing_assets）──────────────────────────────
+
+  def _asset_dir(self, project_id: str) -> Path:
+    return PROJECT_ROOT / settings.writing_dir / project_id / "assets"
+
+  def _serialize_asset(self, record: WritingAssetRecord) -> dict:
+    source = _load_json(record.source_json, {})
+    caption = record.caption or record.filename
+    return {
+      "id": record.id,
+      "project_id": record.project_id,
+      "kind": record.kind,
+      "filename": record.filename,
+      "caption": caption,
+      "source": source,
+      "created_at": record.created_at.isoformat(),
+      "markdown_ref": f"![{caption}](cmasset://{record.id})",
+    }
+
+  def list_assets(self, project_id: str, user_id: str) -> list[dict]:
+    self._verify_project(project_id, user_id)
+    with get_session() as session:
+      rows = session.scalars(
+        select(WritingAssetRecord)
+        .where(WritingAssetRecord.project_id == project_id)
+        .order_by(WritingAssetRecord.created_at.asc())
+      ).all()
+      return [self._serialize_asset(r) for r in rows]
+
+  def create_asset(
+    self,
+    project_id: str,
+    user_id: str,
+    *,
+    kind: str,
+    data: bytes,
+    filename: str = "",
+    caption: str = "",
+    source: dict | None = None,
+  ) -> dict:
+    """把图表二进制写入项目资产目录并登记记录。"""
+    if not data:
+      raise ValueError("图表内容为空")
+    self._verify_project(project_id, user_id)
+
+    now = datetime.now()
+    asset_id = str(uuid.uuid4())
+    raw_name = (filename or "").strip()
+    ext = Path(raw_name).suffix.lower() or ".png"
+    if ext not in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"):
+      ext = ".png"
+    stored_name = f"{asset_id}{ext}"
+    asset_dir = self._asset_dir(project_id)
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    target = asset_dir / stored_name
+    target.write_bytes(data)
+
+    with get_session() as session:
+      record = WritingAssetRecord(
+        id=asset_id,
+        project_id=project_id,
+        kind=kind,
+        filename=raw_name or stored_name,
+        file_path=str(target.relative_to(PROJECT_ROOT))
+        if _is_relative_to(target, PROJECT_ROOT)
+        else str(target),
+        caption=caption.strip(),
+        source_json=json.dumps(source or {}, ensure_ascii=False),
+        created_at=now,
+      )
+      session.add(record)
+      session.commit()
+      return self._serialize_asset(record)
+
+  def get_asset(self, asset_id: str, user_id: str) -> tuple[dict, Path]:
+    """返回 (资产字典, 磁盘绝对路径)，校验项目归属。"""
+    with get_session() as session:
+      record = session.get(WritingAssetRecord, asset_id)
+      if not record:
+        raise ValueError("图表素材不存在")
+      project = session.get(WritingProjectRecord, record.project_id)
+      if not project or project.user_id != user_id:
+        raise ValueError("图表素材不存在或无权访问")
+      path = self.resolve_asset_path(asset_id)
+      if not path or not path.is_file():
+        raise ValueError("图表文件已丢失")
+      return self._serialize_asset(record), path
+
+  def resolve_asset_path(self, asset_id: str) -> Path | None:
+    """按 asset_id 解析磁盘路径（不校验用户，仅供导出/同项目内嵌使用）。"""
+    with get_session() as session:
+      record = session.get(WritingAssetRecord, asset_id)
+      if not record:
+        return None
+      raw = record.file_path
+      if not raw:
+        return None
+      path = Path(raw)
+      if not path.is_absolute():
+        path = PROJECT_ROOT / path
+      return path
+
+
+def _is_relative_to(path: Path, base: Path) -> bool:
+  try:
+    path.relative_to(base)
+    return True
+  except ValueError:
+    return False
 
 
 writing_store = WritingStore()

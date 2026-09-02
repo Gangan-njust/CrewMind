@@ -19,10 +19,11 @@ import {
   createWritingFromWorkflow, fetchWorkspaces, fillMethodsFromWorkflow,
   downloadWritingExport, createWritingSection, updateWritingSectionMeta,
   deleteWritingSection, reorderWritingSections,
+  checkFigures, fetchWritingFigureCandidates, createWritingFigureAsset, writingAssetUrl, getToken,
   getSectionDisplayName, getSectionLabel, isAbstractSection,
   type WritingProject, type WritingProjectSummary,
   type WritingSection, type SectionVersion, type PaperType, type CitationFormat,
-  type OutlineSubsection, type Workspace,
+  type OutlineSubsection, type Workspace, type FigureHintItem,
 } from '../api'
 import { buildFullDocumentMarkdown } from '../writingPreview'
 import { WritingMarkdownPreview } from '../WritingMarkdownPreview'
@@ -39,6 +40,7 @@ import {
   getSectionHeadings,
   type SubheadingLevel,
 } from '../writingHeadings'
+import { figurePlaceholderBlock, insertTextAfterLine } from '../writingFigureHints'
 
 type ToolTab = 'expand' | 'polish' | 'check' | 'citation' | 'version'
 type ExpandMode = 'free' | 'structured'
@@ -217,6 +219,14 @@ export function WritingAssistant({
   const toastTimer = useRef<ReturnType<typeof setTimeout>>()
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
+  // 图表完整性提醒
+  const [figureHints, setFigureHints] = useState<FigureHintItem[]>([])
+  const [ignoredFigureKeys, setIgnoredFigureKeys] = useState<Set<string>>(new Set())
+  const [assetCandidates, setAssetCandidates] = useState<any>(null)
+  const [assetBusy, setAssetBusy] = useState(false)
+  const [expandedAssetPickerKey, setExpandedAssetPickerKey] = useState<string | null>(null)
+  const [candidatesError, setCandidatesError] = useState('')
+
   const hasUnsaved = editContent !== lastSaved.current
   const saveStatus: SaveStatus = saving ? 'saving' : hasUnsaved ? 'unsaved' : 'saved'
 
@@ -225,6 +235,148 @@ export function WritingAssistant({
     if (toastTimer.current) clearTimeout(toastTimer.current)
     toastTimer.current = setTimeout(() => setToast(''), 2600)
   }, [])
+
+  // ── 图表完整性提醒：徽标 / 占位插入 / 真实图表素材 ──────────
+  const figureHintCountFor = useCallback((sectionId: string) => {
+    return figureHints.filter(
+      h => h.section_id === sectionId && (!h.key || !ignoredFigureKeys.has(h.key)),
+    ).length
+  }, [figureHints, ignoredFigureKeys])
+
+  const loadFigureHints = useCallback(async (projectId: string) => {
+    try {
+      const report = await checkFigures(projectId, false)
+      setFigureHints(report.issues || [])
+    } catch {
+      // 徽标加载失败静默处理，可在「检查」Tab 手动重跑
+    }
+  }, [])
+
+  const clearProjectFigureState = useCallback(() => {
+    setFigureHints([])
+    setIgnoredFigureKeys(new Set())
+    setAssetCandidates(null)
+    setExpandedAssetPickerKey(null)
+    setCandidatesError('')
+  }, [])
+
+  const ensureCandidates = useCallback(async () => {
+    if (!activeProject) return
+    if (assetCandidates) return
+    setAssetBusy(true)
+    setCandidatesError('')
+    try {
+      const data = await fetchWritingFigureCandidates(activeProject.id)
+      setAssetCandidates(data)
+    } catch (e: any) {
+      setCandidatesError(e.message)
+    } finally {
+      setAssetBusy(false)
+    }
+  }, [activeProject, assetCandidates])
+
+  const applyFigureContentSave = useCallback(async (next: string, note: string) => {
+    if (!activeSection || !activeProject) return false
+    try {
+      const updated = await updateWritingSection(activeSection.id, {
+        content: next,
+        save_version: true,
+        version_note: note,
+      })
+      lastSaved.current = next
+      setEditContent(next)
+      setActiveSection(updated)
+      setActiveProject(prev => prev ? {
+        ...prev,
+        sections: prev.sections.map(s => s.id === updated.id ? updated : s),
+      } : prev)
+      return true
+    } catch (e: any) {
+      setError(e.message)
+      return false
+    }
+  }, [activeSection, activeProject])
+
+  const handleInsertFigurePlaceholder = useCallback(async (issue: FigureHintItem) => {
+    if (!activeSection || !activeProject) return
+    if (issue.section_id && issue.section_id !== activeSection.id) {
+      showToastMsg(`请先切换到「${issue.display_title || issue.section_type || '目标'}」章节再插入占位`)
+      return
+    }
+    const block = figurePlaceholderBlock(
+      issue.chart_type,
+      issue.suggestion || issue.reason || '',
+      activeSection.section_type,
+    )
+    const next = insertTextAfterLine(editContent, issue.line, block)
+    if (next === editContent) {
+      showToastMsg('插入失败：行号超出正文范围')
+      return
+    }
+    const ok = await applyFigureContentSave(next, '插入图表占位')
+    if (ok) {
+      const issueKey = issue.key
+      if (issueKey) setIgnoredFigureKeys(prev => new Set(prev).add(issueKey))
+      showToastMsg('已插入图表占位（导出时自动清理，可替换为真实图表）')
+      await loadFigureHints(activeProject.id)
+    }
+  }, [activeSection, activeProject, editContent, applyFigureContentSave, loadFigureHints, showToastMsg])
+
+  const handleIgnoreFigure = useCallback((issue: FigureHintItem) => {
+    const issueKey = issue.key
+    if (!issueKey) return
+    setIgnoredFigureKeys(prev => new Set(prev).add(issueKey))
+  }, [])
+
+  const candidateSource = useCallback((cand: any) => {
+    switch (cand.kind) {
+      case 'experiment_chart':
+        return { analysis_id: cand.analysis_id, chart_index: cand.chart_index }
+      case 'experiment_metric':
+        return { experiment_id: cand.experiment_id, metric_name: cand.metric_name }
+      case 'experiment_attachment':
+        return { attachment_id: cand.attachment_id }
+      case 'literature_image':
+        return { workspace_id: cand.workspace_id, literature_id: cand.literature_id, filename: cand.filename }
+      default:
+        return {}
+    }
+  }, [])
+
+  const handleInsertRealAsset = useCallback(async (issue: FigureHintItem, cand: any) => {
+    if (!activeSection || !activeProject) return
+    if (issue.section_id && issue.section_id !== activeSection.id) {
+      showToastMsg(`请先切换到「${issue.display_title || '目标'}」章节再插入真实图表`)
+      return
+    }
+    setAssetBusy(true)
+    try {
+      const asset = await createWritingFigureAsset(activeProject.id, {
+        kind: cand.kind,
+        caption: cand.title || cand.filename || '',
+        source: candidateSource(cand),
+      })
+      const note = (issue.suggestion || issue.reason || '').replace(/\n/g, ' ').slice(0, 60)
+      const extra = note ? `\n\n*（图注建议：${note}）*` : ''
+      const next = insertTextAfterLine(editContent, issue.line, `${asset.markdown_ref}${extra}`)
+      if (next === editContent) {
+        showToastMsg('插入失败：行号超出正文范围')
+        return
+      }
+      const ok = await applyFigureContentSave(next, '插入真实图表')
+      if (ok) {
+        const issueKey = issue.key
+        if (issueKey) setIgnoredFigureKeys(prev => new Set(prev).add(issueKey))
+        setExpandedAssetPickerKey(null)
+        showToastMsg('已插入真实图表（预览可见，导出 docx 自动嵌入）')
+        await loadFigureHints(activeProject.id)
+      }
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setAssetBusy(false)
+    }
+  }, [activeSection, activeProject, editContent, candidateSource, applyFigureContentSave, loadFigureHints, showToastMsg])
 
   const loadProjects = useCallback(async () => {
     setListLoading(true)
@@ -241,6 +393,7 @@ export function WritingAssistant({
   const openProject = useCallback(async (id: string) => {
     setEditorLoading(true)
     setError('')
+    clearProjectFigureState()
     try {
       const project = await fetchWritingProject(id)
       setActiveProject(project)
@@ -252,12 +405,13 @@ export function WritingAssistant({
       setActiveSubheadingKey(null)
       setToolResult(null)
       setCompareResult(null)
+      void loadFigureHints(id)
     } catch (e: any) {
       setError(e.message)
     } finally {
       setEditorLoading(false)
     }
-  }, [])
+  }, [clearProjectFigureState, loadFigureHints])
 
   useEffect(() => { loadProjects() }, [loadProjects])
 
@@ -340,12 +494,13 @@ export function WritingAssistant({
         sections: prev.sections.map(s => s.id === updated.id ? updated : s),
       } : prev)
       showToastMsg('已保存')
+      void loadFigureHints(activeProject.id)
     } catch (e: any) {
       setError(e.message)
     } finally {
       setSaving(false)
     }
-  }, [activeSection, activeProject, editContent, showToastMsg])
+  }, [activeSection, activeProject, editContent, showToastMsg, loadFigureHints])
 
   saveSectionRef.current = saveSection
 
@@ -653,7 +808,7 @@ export function WritingAssistant({
     setPolishStructureItems(prev => prev.map(item => item.id === id ? { ...item, ...patch } : item))
   }, [])
 
-  const runCheck = async (type: 'terminology' | 'coherence' | 'style' | 'citation' | 'blank_lines' | 'keywords_generate' | 'abstract_keywords') => {
+  const runCheck = async (type: 'terminology' | 'coherence' | 'style' | 'citation' | 'blank_lines' | 'keywords_generate' | 'abstract_keywords' | 'figures') => {
     if (type !== 'blank_lines' && !activeProject) return
     if (type === 'blank_lines' && !editContent.trim()) {
       showToastMsg('当前章节暂无内容')
@@ -681,6 +836,11 @@ export function WritingAssistant({
       } else if (type === 'abstract_keywords') {
         result = await checkAbstractKeywords(activeProject!.id)
         result = { type: 'abstract_keywords', ...result }
+      } else if (type === 'figures') {
+        result = await checkFigures(activeProject!.id, true)
+        setFigureHints(result.issues || [])
+        setExpandedAssetPickerKey(null)
+        result = { type: 'figures', ...result }
       } else result = await checkCitationCompleteness(activeProject!.id)
       if (!result.type) setToolResult({ type, ...result })
       else setToolResult(result)
@@ -1062,8 +1222,9 @@ export function WritingAssistant({
       setEditContent('')
       lastSaved.current = ''
     }
+    void loadFigureHints(project.id)
     return project
-  }, [activeProject, activeSection?.id])
+  }, [activeProject, activeSection?.id, loadFigureHints])
 
   const handleAddSection = async () => {
     if (!activeProject || !newSectionTitle.trim()) return
@@ -1570,6 +1731,7 @@ export function WritingAssistant({
                     activeSubheadingKey={activeSubheadingKey}
                     activeSectionId={activeSection?.id ?? null}
                     editContent={editContent}
+                    figureHintCount={figureHintCountFor(sec.id)}
                     onToggleExpand={() => toggleSectionExpanded(sec.id)}
                     onSelect={() => selectSection(sec)}
                     onJumpToSubheading={line => jumpToSubheading(sec, line)}
@@ -1640,6 +1802,16 @@ export function WritingAssistant({
                   <span className="writing-toolbar-stat">v{activeSection.version}</span>
                 )}
                 <span className="writing-toolbar-stat">{editContent.length} 字符</span>
+                {activeSection && figureHintCountFor(activeSection.id) > 0 && (
+                  <button
+                    type="button"
+                    className="writing-toolbar-stat writing-toolbar-figure-hint"
+                    title="运行「图表完整」检查并查看建议位置"
+                    onClick={() => { setToolTab('check'); void runCheck('figures') }}
+                  >
+                    📊 建议插图 {figureHintCountFor(activeSection.id)}
+                  </button>
+                )}
               </div>
               <div className="toolbar-right">
                 {!isAbstractSection(activeSection?.section_type ?? '') && (
@@ -1693,7 +1865,18 @@ export function WritingAssistant({
                 />
               ) : (
                 <div className="writing-preview markdown-body">
-                  <WritingMarkdownPreview content={editContent || '*暂无内容，返回编辑模式后可输入正文*'} />
+                  <WritingMarkdownPreview
+                    content={editContent || '*暂无内容，返回编辑模式后可输入正文*'}
+                    hints={activeSection
+                      ? figureHints.filter(
+                          h => h.section_id === activeSection.id
+                            && (!h.key || !ignoredFigureKeys.has(h.key)),
+                        )
+                      : []}
+                    assetUrlFor={activeProject
+                      ? assetId => writingAssetUrl(activeProject.id, assetId)
+                      : undefined}
+                  />
                 </div>
               )}
             </div>
@@ -2045,6 +2228,7 @@ export function WritingAssistant({
                       ['coherence', '逻辑连贯'],
                       ['style', '表达规范'],
                       ['citation', '引用完整'],
+                      ['figures', '图表完整'],
                       ['abstract_keywords', 'Abstract 检查'],
                       ['blank_lines', '去除空行'],
                     ] as const).map(([k, label]) => (
@@ -2120,6 +2304,21 @@ export function WritingAssistant({
                             </button>
                           )}
                         </>
+                      ) : toolResult.type === 'figures' ? (
+                        <FigureCheckPanel
+                          report={toolResult}
+                          activeSection={activeSection}
+                          ignoredKeys={ignoredFigureKeys}
+                          onInsertPlaceholder={handleInsertFigurePlaceholder}
+                          onIgnore={handleIgnoreFigure}
+                          ensureCandidates={ensureCandidates}
+                          onInsertAsset={handleInsertRealAsset}
+                          assetCandidates={assetCandidates}
+                          assetBusy={assetBusy}
+                          expandedAssetPickerKey={expandedAssetPickerKey}
+                          setExpandedAssetPickerKey={setExpandedAssetPickerKey}
+                          candidatesError={candidatesError}
+                        />
                       ) : (
                         <>
                       {(toolResult.overall_score ?? toolResult.score) != null && (
@@ -2393,7 +2592,12 @@ export function WritingAssistant({
               </button>
             </div>
             <div className="writing-full-preview-body markdown-body">
-              <WritingMarkdownPreview content={fullPreviewMarkdown} />
+              <WritingMarkdownPreview
+                content={fullPreviewMarkdown}
+                assetUrlFor={activeProject
+                  ? assetId => writingAssetUrl(activeProject.id, assetId)
+                  : undefined}
+              />
             </div>
             <div className="writing-full-preview-footer">
               <span className="writing-full-preview-hint">
@@ -2544,6 +2748,112 @@ function SectionRewriteItemEditor({
   )
 }
 
+function FigureCheckPanel({
+  report,
+  activeSection,
+  ignoredKeys,
+  onInsertPlaceholder,
+  onIgnore,
+  ensureCandidates,
+  onInsertAsset,
+  assetCandidates,
+  assetBusy,
+  expandedAssetPickerKey,
+  setExpandedAssetPickerKey,
+  candidatesError,
+}: {
+  report: any
+  activeSection: WritingSection | null
+  ignoredKeys: Set<string>
+  onInsertPlaceholder: (issue: FigureHintItem) => void
+  onIgnore: (issue: FigureHintItem) => void
+  ensureCandidates: () => void
+  onInsertAsset: (issue: FigureHintItem, cand: any) => void
+  assetCandidates: any
+  assetBusy: boolean
+  expandedAssetPickerKey: string | null
+  setExpandedAssetPickerKey: (key: string | null) => void
+  candidatesError: string
+}) {
+  const issues: FigureHintItem[] = (report.issues || []).filter(
+    (i: FigureHintItem) => i.key ? !ignoredKeys.has(i.key) : true,
+  )
+  const togglePicker = (key: string) => {
+    if (expandedAssetPickerKey === key) {
+      setExpandedAssetPickerKey(null)
+      return
+    }
+    setExpandedAssetPickerKey(key)
+    ensureCandidates()
+  }
+  return (
+    <div className="writing-figures-panel">
+      <div className="writing-figures-stats">
+        <span>全文已有 {report.figure_count ?? 0} 张图 · {report.table_count ?? 0} 张表</span>
+        {report.used_llm ? <span className="writing-chip">AI 语义检查</span> : null}
+      </div>
+      {report.summary && <p className="writing-result-summary">{report.summary}</p>}
+      {issues.length === 0 ? (
+        <p className="writing-muted">未发现明显缺图表的位置 🎉</p>
+      ) : (
+        issues.map((issue: FigureHintItem, i: number) => {
+          const isCurrent = !!issue.section_id && !!activeSection && issue.section_id === activeSection.id
+          const pickerOpen = expandedAssetPickerKey === issue.key
+          return (
+            <div key={issue.key || i} className={`writing-check-card severity-${issue.severity || 'medium'} writing-figure-card`}>
+              <div className="writing-figure-card-head">
+                <strong>📊 建议插入【{issue.chart_type}】</strong>
+                <span className="writing-figure-card-loc">
+                  {issue.display_title || issue.section_type || '正文'} · 第 {issue.line} 行
+                  {isCurrent ? ' · 当前章节' : ''}
+                </span>
+              </div>
+              {issue.anchor_text && <p className="writing-figure-anchor">“{issue.anchor_text}”</p>}
+              {issue.reason && <p className="writing-figure-reason">{issue.reason}</p>}
+              {issue.suggestion && <p className="writing-figure-suggestion">{issue.suggestion}</p>}
+              <div className="writing-figure-actions">
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  disabled={!isCurrent || assetBusy}
+                  onClick={() => isCurrent && onInsertPlaceholder(issue)}
+                  title={isCurrent ? '插入占位符（导出时自动清理）' : '请先切换到该章节'}
+                >
+                  插入占位
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-outline btn-sm"
+                  disabled={!isCurrent}
+                  onClick={() => isCurrent && togglePicker(issue.key || '')}
+                  title={isCurrent ? '从实验结果/文献图插入真实图表' : '请先切换到该章节'}
+                >
+                  素材插入{pickerOpen ? ' ▾' : ''}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-outline btn-sm"
+                  onClick={() => onIgnore(issue)}
+                >
+                  忽略
+                </button>
+              </div>
+              {pickerOpen && isCurrent && (
+                <FigureCandidatesPicker
+                  candidates={assetCandidates}
+                  busy={assetBusy}
+                  error={candidatesError}
+                  onInsert={(cand) => onInsertAsset(issue, cand)}
+                />
+              )}
+            </div>
+          )
+        })
+      )}
+    </div>
+  )
+}
+
 function SectionTreeNode({
   section,
   displayName,
@@ -2553,6 +2863,7 @@ function SectionTreeNode({
   activeSubheadingKey,
   activeSectionId,
   editContent,
+  figureHintCount,
   onToggleExpand,
   onSelect,
   onJumpToSubheading,
@@ -2566,6 +2877,7 @@ function SectionTreeNode({
   activeSubheadingKey: string | null
   activeSectionId: string | null
   editContent: string
+  figureHintCount: number
   onToggleExpand: () => void
   onSelect: () => void
   onJumpToSubheading: (line: number) => void
@@ -2602,6 +2914,14 @@ function SectionTreeNode({
             <span className="section-auto-badge" title="自动维护">自动</span>
           )}
           <span className="section-words">{section.word_count || '—'}</span>
+          {figureHintCount > 0 && (
+            <span
+              className="writing-section-figure-badge"
+              title={`本章节有 ${figureHintCount} 处建议配图位置，可运行「图表完整」检查`}
+            >
+              📊 {figureHintCount}
+            </span>
+          )}
         </button>
       </div>
 
@@ -2667,6 +2987,98 @@ function SectionTreeNode({
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+const FIGURE_SOURCE_LABELS: Record<string, string> = {
+  experiment_chart: '实验分析图',
+  experiment_metric: '指标曲线',
+  experiment_attachment: '实验照片',
+  literature_image: '文献图',
+}
+
+function urlWithToken(url: string): string {
+  const token = getToken()
+  if (!token) return url
+  const sep = url.includes('?') ? '&' : '?'
+  return `${url}${sep}token=${encodeURIComponent(token)}`
+}
+
+function FigureCandidatesPicker({
+  candidates,
+  busy,
+  error,
+  onInsert,
+}: {
+  candidates: any
+  busy: boolean
+  error: string
+  onInsert: (cand: any) => void
+}) {
+  if (busy) {
+    return <div className="writing-candidates-state">正在加载可插入的图表素材…</div>
+  }
+  if (error) {
+    return <div className="writing-candidates-state writing-candidates-error">{error}</div>
+  }
+  if (!candidates || (candidates.total ?? 0) === 0) {
+    return (
+      <div className="writing-candidates-state writing-candidates-empty">
+        未找到可用素材：请先为写作项目关联实验记录（从同一工作方案创建）或文献工作空间，
+        并在实验/文献中完成数据上传与分析。
+      </div>
+    )
+  }
+  const groups: { key: string; label: string }[] = [
+    { key: 'experiment_charts', label: '实验分析图表' },
+    { key: 'experiment_metrics', label: '实验指标曲线' },
+    { key: 'experiment_attachments', label: '实验照片' },
+    { key: 'literature_images', label: '文献配图' },
+  ]
+  return (
+    <div className="writing-candidates-picker">
+      {groups.map(group => {
+        const items: any[] = candidates?.[group.key] || []
+        if (!items.length) return null
+        return (
+          <div key={group.key} className="writing-candidates-group">
+            <h6>{group.label}（{items.length}）</h6>
+            <ul className="writing-candidates-list">
+              {items.map((cand, idx) => {
+                const title = cand.title || cand.filename
+                  || `${FIGURE_SOURCE_LABELS[cand.kind] || '素材'} ${idx + 1}`
+                const sub = cand.experiment_title || cand.literature_title
+                  || FIGURE_SOURCE_LABELS[cand.kind] || ''
+                return (
+                  <li
+                    key={`${group.key}-${cand.analysis_id || cand.attachment_id || cand.metric_name || cand.filename || idx}`}
+                  >
+                    {cand.url ? (
+                      <img src={urlWithToken(cand.url)} alt="" className="writing-candidate-thumb" loading="lazy" />
+                    ) : (
+                      <span className="writing-candidate-thumb writing-candidate-thumb-placeholder">
+                        📊
+                      </span>
+                    )}
+                    <div className="writing-candidate-info">
+                      <span className="writing-candidate-title">{title}</span>
+                      <span className="writing-candidate-sub">
+                        {sub}
+                        {cand.page ? ` · 第 ${cand.page} 页` : ''}
+                        {cand.context ? ` · ${cand.context}` : ''}
+                      </span>
+                    </div>
+                    <button type="button" className="btn btn-outline btn-sm" onClick={() => onInsert(cand)}>
+                      插入
+                    </button>
+                  </li>
+                )
+              })}
+            </ul>
+          </div>
+        )
+      })}
     </div>
   )
 }

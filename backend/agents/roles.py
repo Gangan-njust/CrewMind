@@ -8,6 +8,7 @@ class ScenarioType(str, Enum):
   EXPERIMENT_DESIGN = "experiment_design"
   FULL_PROPOSAL = "full_proposal"
   LITERATURE_BASED_PROPOSAL = "literature_based_proposal"
+  LITERATURE_BASED_REVIEW = "literature_based_review"
 
 
 @dataclass
@@ -210,6 +211,9 @@ SCENARIO_AGENTS: dict[ScenarioType, list[str]] = {
     "planner", "literature_researcher", "experiment_designer",
     "resource_analyst", "review_specialist", *DOMAIN_REVIEWER_IDS,
   ],
+  ScenarioType.LITERATURE_BASED_REVIEW: [
+    "planner", "literature_researcher", "review_specialist", *DOMAIN_REVIEWER_IDS,
+  ],
 }
 
 SCENARIO_LABELS: dict[ScenarioType, str] = {
@@ -217,4 +221,5 @@ SCENARIO_LABELS: dict[ScenarioType, str] = {
   ScenarioType.EXPERIMENT_DESIGN: "实验方案设计",
   ScenarioType.FULL_PROPOSAL: "完整工作方案",
   ScenarioType.LITERATURE_BASED_PROPOSAL: "基于文献的开题报告",
+  ScenarioType.LITERATURE_BASED_REVIEW: "基于文献的文献综述",
 }

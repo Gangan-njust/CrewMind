@@ -3,7 +3,7 @@ import re
 
 FULL_WIDTH_INDENT = "　　"
 _SKIP_FIRST_LINE = re.compile(
-  r"^(#{1,6}\s|关键词[：:]|Keywords[：:]|\[\d+\]|[-*•·]\s|\||```)"
+  r"^(#{1,6}\s|<!--|!\[|关键词[：:]|Keywords[：:]|\[\d+\]|[-*•·]\s|\||```)"
 )
 
 

@@ -3,7 +3,7 @@ import logging
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from backend.auth import get_current_user
@@ -12,6 +12,7 @@ from backend.storage.writing_store import writing_store
 from backend.writing.assistant import (
   apply_term_replacement,
   check_coherence,
+  check_figures,
   check_style,
   check_terminology,
   clean_blank_lines,
@@ -19,6 +20,8 @@ from backend.writing.assistant import (
   polish_text,
   rule_based_style_check,
 )
+from backend.writing.figure_hints import detect_text_figure_hints
+from backend.writing.assets import list_figure_candidates, resolve_source_bytes
 from backend.writing.abstract_keywords import (
   check_abstract_and_keywords,
   compose_abstract_content,
@@ -155,6 +158,26 @@ class StyleCheckRequest(BaseModel):
 
 class BlankLinesCheckRequest(BaseModel):
   text: str = Field(default="")
+
+
+class FigureSectionCheckRequest(BaseModel):
+  text: str = Field(..., min_length=1)
+  section_type: str = "intro"
+
+
+class FigureCheckRequest(BaseModel):
+  project_id: str
+  use_llm: bool = True
+
+
+class FigureAssetCreateRequest(BaseModel):
+  kind: str = Field(
+    ...,
+    pattern="^(experiment_chart|experiment_metric|experiment_attachment|literature_image|upload)$",
+  )
+  caption: str = Field("", max_length=256)
+  source: dict = Field(default_factory=dict)
+  data_base64: str = Field("", max_length=80_000_000)
 
 
 class CitationRecommendRequest(BaseModel):
@@ -556,6 +579,98 @@ async def check_blank_lines_api(
   return clean_blank_lines(req.text)
 
 
+@router.post("/check/figures")
+async def check_figures_api(
+  req: FigureCheckRequest,
+  current_user: User = Depends(get_current_user),
+):
+  """全文图表完整性检查（规则预检 + 可选 LLM 语义细化）。"""
+  try:
+    project, _ = _get_project_topic(req.project_id, current_user.id)
+    return await check_figures(project, use_llm=req.use_llm)
+  except ValueError as e:
+    raise HTTPException(404, str(e))
+
+
+@router.post("/check/figures/section")
+async def check_figures_section_api(req: FigureSectionCheckRequest):
+  """单节图表提醒轻量检查（纯规则，供编辑器实时使用）。"""
+  return detect_text_figure_hints(req.text, req.section_type)
+
+
+@router.get("/projects/{project_id}/figure-candidates")
+async def figure_candidates_api(
+  project_id: str,
+  current_user: User = Depends(get_current_user),
+):
+  """列出写作项目可插入的真实图表素材（实验图表/指标曲线/附件/文献图）。"""
+  try:
+    project, _ = _get_project_topic(project_id, current_user.id)
+    return list_figure_candidates(project, current_user.id)
+  except ValueError as e:
+    raise HTTPException(404, str(e))
+
+
+@router.post("/projects/{project_id}/assets")
+async def create_asset_api(
+  project_id: str,
+  req: FigureAssetCreateRequest,
+  current_user: User = Depends(get_current_user),
+):
+  """把素材生成/拷贝为项目资产，返回 markdown_ref（正文直接引用）。"""
+  try:
+    project, _ = _get_project_topic(project_id, current_user.id)
+    data, filename, caption, meta = resolve_source_bytes(
+      current_user.id,
+      req.kind,
+      req.source,
+      data_base64=req.data_base64,
+      caption=req.caption,
+    )
+    return writing_store.create_asset(
+      project_id,
+      current_user.id,
+      kind=req.kind,
+      data=data,
+      filename=filename,
+      caption=caption,
+      source=meta,
+    )
+  except ValueError as e:
+    raise HTTPException(400, str(e))
+
+
+@router.get("/projects/{project_id}/assets/{asset_id}")
+async def get_asset_image(
+  project_id: str,
+  asset_id: str,
+  token: str = Query(""),
+):
+  """返回写作项目内嵌图表文件。
+
+  通过 token 查询参数鉴权（而非 Authorization 头），使 <img> 标签可直接内联展示。
+  """
+  from backend.auth import decode_token, get_user_by_id
+
+  if not token:
+    raise HTTPException(401, "未登录")
+  try:
+    payload = decode_token(token)
+    user = get_user_by_id(payload.get("sub", ""))
+    if not user:
+      raise HTTPException(401, "用户不存在")
+  except HTTPException:
+    raise HTTPException(401, "登录已过期")
+
+  try:
+    asset, path = writing_store.get_asset(asset_id, user.id)
+  except ValueError:
+    raise HTTPException(404, "图表素材不存在或无权访问")
+  if asset.get("project_id") != project_id:
+    raise HTTPException(404, "图表素材不属于该项目")
+  return FileResponse(str(path))
+
+
 @router.post("/check/keywords/generate")
 async def generate_keywords_api(
   req: CoherenceCheckRequest,
@@ -729,6 +844,7 @@ async def export_project(
   project_id: str,
   format: str = Query("md", pattern="^(md|docx)$"),
   include_bibliography: bool = Query(True),
+  keep_placeholders: bool = Query(False),
   current_user: User = Depends(get_current_user),
 ):
   try:
@@ -738,10 +854,14 @@ async def export_project(
       bibliography = get_bibliography_for_project(project_id, current_user.id, project)
 
     if format == "docx":
-      content = build_docx(project, bibliography)
+      content = build_docx(
+        project, bibliography, keep_image_placeholders=keep_placeholders
+      )
       media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     else:
-      content = build_markdown(project, bibliography).encode("utf-8")
+      content = build_markdown(
+        project, bibliography, keep_image_placeholders=keep_placeholders
+      ).encode("utf-8")
       media_type = "text/markdown; charset=utf-8"
 
     filename = export_filename(project, format)

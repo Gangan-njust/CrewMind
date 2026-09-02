@@ -1351,11 +1351,20 @@ function DashboardPage({
 
 /* ── Export Buttons ─────────────────────────────────────────── */
 
-function ExportButtons({ crewId, recordId }: { crewId?: string; recordId?: string }) {
-  type ExportKey = `${'full' | 'proposal'}-${'md' | 'docx' | 'tex'}`
+function ExportButtons({
+  crewId, recordId, scenario,
+}: { crewId?: string; recordId?: string; scenario?: string }) {
+  type ExportScope = 'full' | 'proposal' | 'pure'
+  type ExportKey = `${ExportScope}-${'md' | 'docx' | 'tex'}`
   const [exporting, setExporting] = useState<ExportKey | null>(null)
 
-  const handleExport = async (format: 'md' | 'docx' | 'tex', scope: 'full' | 'proposal' = 'full') => {
+  const isReviewRun = !!scenario && scenario.includes('review')
+  // 兼容旧调用（未传 scenario 时按原有逻辑全部展示）
+  const showProposalScope = scenario
+    ? ['literature_based_proposal', 'full_proposal', 'experiment_design', 'proposal'].includes(scenario)
+    : true
+
+  const handleExport = async (format: 'md' | 'docx' | 'tex', scope: ExportScope = 'full') => {
     const key: ExportKey = `${scope}-${format}`
     setExporting(key)
     try {
@@ -1367,7 +1376,7 @@ function ExportButtons({ crewId, recordId }: { crewId?: string; recordId?: strin
     }
   }
 
-  const renderFormatButtons = (scope: 'full' | 'proposal', labels: { md: string; docx: string; tex: string }) => (
+  const renderFormatButtons = (scope: ExportScope, labels: { md: string; docx: string; tex: string }) => (
     <>
       <button
         className="btn btn-outline"
@@ -1396,21 +1405,26 @@ function ExportButtons({ crewId, recordId }: { crewId?: string; recordId?: strin
     </>
   )
 
+  const formatLabels = {
+    md: 'Markdown',
+    docx: 'Word',
+    tex: 'LaTeX',
+  }
+
   return (
     <div className="export-toolbar">
       <span className="export-label">导出方案</span>
-      {renderFormatButtons('full', {
-        md: 'Markdown',
-        docx: 'Word',
-        tex: 'LaTeX',
-      })}
+      {renderFormatButtons('full', formatLabels)}
+      {showProposalScope && (
+        <>
+          <span className="export-divider" />
+          <span className="export-label">仅开题报告</span>
+          {renderFormatButtons('proposal', formatLabels)}
+        </>
+      )}
       <span className="export-divider" />
-      <span className="export-label">仅开题报告</span>
-      {renderFormatButtons('proposal', {
-        md: 'Markdown',
-        docx: 'Word',
-        tex: 'LaTeX',
-      })}
+      <span className="export-label">{isReviewRun ? '纯综述' : '纯文章'}</span>
+      {renderFormatButtons('pure', formatLabels)}
     </div>
   )
 }
@@ -1478,7 +1492,10 @@ function WorkflowPage({
             </button>
           )}
           {canExport && crewId && (
-            <ExportButtons crewId={crewId} />
+            <ExportButtons
+              crewId={crewId}
+              scenario={workflowStatus?.scenario || scenario?.id}
+            />
           )}
         </div>
       )}
@@ -2178,7 +2195,7 @@ function HistoryPage({
           {selectedRecord.metadata?.partial && (
             <span className="partial-badge"><AlertTriangle size={12} /> 部分结果</span>
           )}
-          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
             <button
               className="btn btn-primary"
               disabled={creatingWriting}
@@ -2209,7 +2226,7 @@ function HistoryPage({
               {creatingExperiment ? <Loader size={16} className="spinner" /> : <FlaskConical size={16} />}
               创建实验项目
             </button>
-            <ExportButtons recordId={selectedRecord.id} />
+            <ExportButtons recordId={selectedRecord.id} scenario={selectedRecord.scenario} />
           </div>
         </div>
         <p className="page-desc">

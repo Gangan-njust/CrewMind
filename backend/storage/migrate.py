@@ -24,6 +24,7 @@ from backend.storage.models import (
   WritingReferenceRecord,
   WritingSectionRecord,
   WritingSectionVersionRecord,
+  WritingAssetRecord,
   ExperimentRecord,
   ExperimentEntryRecord,
   ExperimentAttachmentRecord,
@@ -149,6 +150,10 @@ def run_migrations(engine) -> None:
     if not _table_exists(inspector, "writing_references"):
       WritingReferenceRecord.__table__.create(bind=conn)
       logger.info("已创建 writing_references 表")
+
+    if not _table_exists(inspector, "writing_assets"):
+      WritingAssetRecord.__table__.create(bind=conn)
+      logger.info("已创建 writing_assets 表")
 
     if _table_exists(inspector, "writing_sections") and not _column_exists(
       inspector, "writing_sections", "title"

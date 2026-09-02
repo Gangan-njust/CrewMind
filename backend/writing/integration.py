@@ -16,6 +16,9 @@ TASK_OUTPUT_KEYS = {
   "literature_based_proposal": [
     "task_planning", "task_literature", "task_experiment", "task_budget",
   ],
+  "literature_based_review": [
+    "task_planning", "task_literature",
+  ],
 }
 
 

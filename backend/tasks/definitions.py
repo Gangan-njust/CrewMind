@@ -388,4 +388,78 @@ TASK_FLOWS: dict[ScenarioType, list[TaskDefinition]] = {
 ## 10. 文献数据库说明""",
     ),
   ],
+
+  ScenarioType.LITERATURE_BASED_REVIEW: [
+    TaskDefinition(
+      id="task_planning",
+      name="综述框架规划",
+      description=(
+        "基于用户选定文献库的分析结果与综述主题，规划系统性文献综述的写作框架："
+        "界定综述范围、确定分类维度（按主题/方法/发展阶段/国别等）、设计章节结构。"
+        "须优先引用用户文献库内容，标注引用编号。"
+      ),
+      agent_id="planner",
+      output_format=OutputFormat.MARKDOWN,
+      output_template="""# 文献综述 · 撰写框架
+
+## 1. 综述主题与核心问题
+## 2. 研究背景与研究意义
+## 3. 综述范围界定与文献纳入说明
+## 4. 关键概念界定
+## 5. 拟采用的组织脉络与分类维度
+## 6. 综述章节结构设计
+## 7. 写作重点与述评提示""",
+    ),
+    TaskDefinition(
+      id="task_literature",
+      name="综述撰写",
+      description=(
+        "严格按照学术文献综述（literature review）写作规范，基于用户选定文献库的分析结果撰写完整综述正文："
+        "围绕主题按维度归纳、比较与评述文献，避免逐篇罗列摘要；"
+        "正文引用以 [编号] 标注且编号须与用户文献库一致；"
+        "识别研究现状、争论点、研究空白与未来方向。网络检索仅作补充并须标注来源。"
+      ),
+      agent_id="literature_researcher",
+      depends_on=["task_planning"],
+      output_format=OutputFormat.MARKDOWN,
+      output_template="""# 文献综述
+
+## 1 引言
+（研究背景与意义、综述目的与范围）
+## 2 文献检索与筛选说明
+（数据源、时间范围、纳入标准；区分用户文献库与网络来源）
+## 3 国内外研究现状
+（按主题维度/发展脉络组织小节，逐类综述并给出述评）
+### 3.1 （主题一）
+### 3.2 （主题二）
+## 4 主要研究方法与技术对比
+## 5 现有研究存在的问题与争论
+## 6 研究空白与未来展望
+## 7 结论
+## 8 参考文献
+（每条格式：[编号] 作者. 标题. 期刊, 年份. DOI/链接；编号须与正文引用一致）
+## 9 文献数据库说明""",
+    ),
+    *_domain_review_tasks(["task_planning", "task_literature"]),
+    TaskDefinition(
+      id="task_review",
+      name="综述终审",
+      description=(
+        "以学术期刊审稿人视角审查综述的完整性、准确性、逻辑结构与学术规范，"
+        "综合各学科审稿意见后整合输出完整文献综述。"
+      ),
+      agent_id="review_specialist",
+      depends_on=["task_planning", "task_literature", *_DOMAIN_REVIEW_DEPS],
+      requires_human_review=True,
+      output_format=OutputFormat.MARKDOWN,
+      output_template="""# 综述终审报告
+
+## 1 质量评估（1-10分）
+## 2 主要优点
+## 3 存在问题
+## 4 改进建议
+## 5 完整文献综述（整合版）
+（按「引言 → 文献检索与筛选 → 国内外研究现状 → 研究方法对比 → 问题与争论 → 研究空白与展望 → 结论 → 参考文献」结构输出，正文保留 [编号] 引用）""",
+    ),
+  ],
 }
