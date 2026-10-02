@@ -111,6 +111,7 @@ class LiteratureRecord(Base):
   abstract: Mapped[str] = mapped_column(Text, nullable=False, default="")
   pdf_path: Mapped[str] = mapped_column(String(512), nullable=False, default="")
   full_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+  translation_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
   uploaded_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
   status: Mapped[str] = mapped_column(String(32), index=True, nullable=False, default="pending")
 

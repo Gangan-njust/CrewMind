@@ -12,6 +12,7 @@ except ImportError:
   magic = None
 
 _TEXT_CACHE: dict[str, str] = {}
+_PAGES_CACHE: dict[str, list[str]] = {}
 
 
 def resolve_pdf_path(pdf_path: str | Path) -> Path:
@@ -40,25 +41,19 @@ def is_pdf_file(path: str | Path, content: bytes | None = None) -> bool:
   return True
 
 
-def extract_full_text(pdf_path: str | Path, *, use_cache: bool = True) -> str:
-  """从 PDF 提取全文文本"""
+def extract_pages_text(pdf_path: str | Path, *, use_cache: bool = True) -> list[str]:
+  """逐页提取 PDF 文本（保留原始页码顺序，供图片按页定位译文位置使用）"""
   path = resolve_pdf_path(pdf_path)
   key = str(path)
-  if use_cache and key in _TEXT_CACHE:
-    return _TEXT_CACHE[key]
+  if use_cache and key in _PAGES_CACHE:
+    return list(_PAGES_CACHE[key])
 
   if not path.exists():
     raise FileNotFoundError(f"PDF 文件不存在: {path}")
 
   try:
     reader = PdfReader(str(path))
-    parts: list[str] = []
-    for page in reader.pages:
-      text = page.extract_text() or ""
-      if text.strip():
-        parts.append(text)
-
-    full_text = sanitize_unicode("\n\n".join(parts).strip())
+    pages = [sanitize_unicode(page.extract_text() or "") for page in reader.pages]
   except Exception as e:
     err = str(e)
     if "cryptography" in err.lower() or "AES algorithm" in err:
@@ -67,6 +62,21 @@ def extract_full_text(pdf_path: str | Path, *, use_cache: bool = True) -> str:
         "请运行: py -m pip install \"cryptography>=3.1\" 后重启服务"
       ) from e
     raise
+
+  if use_cache:
+    _PAGES_CACHE[key] = pages
+  return list(pages)
+
+
+def extract_full_text(pdf_path: str | Path, *, use_cache: bool = True) -> str:
+  """从 PDF 提取全文文本"""
+  path = resolve_pdf_path(pdf_path)
+  key = str(path)
+  if use_cache and key in _TEXT_CACHE:
+    return _TEXT_CACHE[key]
+
+  pages = extract_pages_text(path, use_cache=use_cache)
+  full_text = sanitize_unicode("\n\n".join(page for page in pages if page.strip()).strip())
 
   if use_cache:
     _TEXT_CACHE[key] = full_text
@@ -87,3 +97,4 @@ def extract_batch(pdf_paths: list[str | Path], *, use_cache: bool = True) -> dic
 
 def clear_text_cache() -> None:
   _TEXT_CACHE.clear()
+  _PAGES_CACHE.clear()

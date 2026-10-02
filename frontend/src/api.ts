@@ -580,6 +580,89 @@ export interface LiteratureImage {
   context?: string
 }
 
+export type LiteratureTranslationStatus = 'pending' | 'running' | 'paused' | 'done' | 'failed'
+
+/** 译文版式块类型：文本（经大模型翻译）/ 表格（原样保留）/ 图片（按原文位置内联） */
+export type LiteratureTranslationBlockKind = 'text' | 'table' | 'figure' | 'reference'
+
+export interface LiteratureTranslationBlock {
+  index: number
+  kind: LiteratureTranslationBlockKind
+  /** body 为正文；caption 为图表题注（原文保留在 content，译文在 translation） */
+  role?: 'body' | 'caption'
+  /** 题注归属：figure / table */
+  caption_kind?: 'figure' | 'table' | ''
+  /** 图表编号（Figure / Table 的序号），用于完整性核对 */
+  number?: string | null
+  /** 图注未提取到原图时为 true，前端渲染占位块而非静默跳过 */
+  placeholder?: boolean
+  char_start?: number
+  char_end?: number
+  /** 该块的英文原文（对照阅读左列使用；旧译文可能为空） */
+  source?: string
+  translation: string
+  /** 表格块为原样保留的表格内容（Markdown / 围栏代码块）；题注块为原文题注；图片块为空 */
+  content?: string
+  /** 图片块的文件名（用于拼接带鉴权的图片地址） */
+  filename?: string
+  /** 图片在原文中的页码 */
+  page?: number | null
+  caption?: string
+}
+
+/** 图表完整性统计：原文引用编号与译文版式块的比对结果 */
+export interface LiteratureReferenceStats {
+  figure_refs?: string[]
+  table_refs?: string[]
+  figure_blocks?: number
+  table_blocks?: number
+  caption_blocks?: number
+  placeholder_figures?: number
+  unknown_images?: number
+  missing_figures?: string[]
+  missing_tables?: string[]
+  warnings?: string[]
+}
+
+/** 列表接口返回的译文元信息（不含全文） */
+export interface LiteratureTranslationMeta {
+  status: LiteratureTranslationStatus
+  target_language: string
+  model: string
+  source_chars: number
+  translation_chars: number
+  segment_total: number
+  segment_done: number
+  block_total?: number
+  figure_total?: number
+  table_total?: number
+  caption_total?: number
+  warnings?: string[]
+  number_checks?: string[]
+  reference?: LiteratureReferenceStats
+  translated_at: string | null
+  error: string
+}
+
+export interface LiteratureTranslationSegment {
+  index: number
+  char_start: number
+  char_end: number
+  translation: string
+}
+
+/** 完整译文（含 markdown 全文、版式块与分段结果） */
+export interface LiteratureTranslation extends LiteratureTranslationMeta {
+  source_language: string
+  content_hash: string
+  glossary: string
+  markdown: string
+  segments: LiteratureTranslationSegment[]
+  /** 版式块：按原文顺序排列的文本 / 表格 / 图片（旧译文可能为空，此时回退按 markdown 展示） */
+  blocks?: LiteratureTranslationBlock[]
+  layout?: string
+}
+
 export interface LiteratureAnalysis {
   id?: string
   tags: string[]
@@ -609,8 +692,11 @@ export interface Literature {
   abstract: string
   status: 'pending' | 'processing' | 'done' | 'failed'
   uploaded_at: string
+  /** 原始 PDF 的存放路径（存在即可在对照阅读中按原格式展示） */
+  pdf_path?: string
   analysis?: LiteratureAnalysis
   index_status?: LiteratureIndexStatus
+  translation?: LiteratureTranslationMeta | null
 }
 
 export interface LiteratureIndexStatus {
@@ -817,6 +903,16 @@ export async function reindexLiterature(
   return res.json()
 }
 
+export function literaturePdfUrl(
+  workspaceId: string,
+  literatureId: string,
+): string {
+  const base = `${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/literatures/${encodeURIComponent(literatureId)}/pdf`
+  const token = getToken()
+  if (!token) return base
+  return `${base}?token=${encodeURIComponent(token)}`
+}
+
 export function literatureImageUrl(
   workspaceId: string,
   literatureId: string,
@@ -826,6 +922,118 @@ export function literatureImageUrl(
   const token = getToken()
   if (!token) return base
   return `${base}?token=${encodeURIComponent(token)}`
+}
+
+export async function fetchLiteratureTranslation(
+  workspaceId: string,
+  literatureId: string,
+): Promise<LiteratureTranslation> {
+  const res = await authFetch(
+    `${API_BASE}/workspaces/${workspaceId}/literatures/${literatureId}/translation`,
+  )
+  if (!res.ok) throw new Error(await parseError(res, '获取全文翻译失败'))
+  return res.json()
+}
+
+/** 把 SSE 中的版式块事件转换为前端块结构（表格块带内容、图片块带文件名与页码） */
+function toTranslationBlock(payload: any): LiteratureTranslationBlock | undefined {
+  const blockIndex = Number(payload?.block_index || 0)
+  if (!blockIndex) return undefined
+  const kind = payload?.kind
+  return {
+    index: blockIndex,
+    kind: kind === 'table' || kind === 'figure' ? kind : 'text',
+    translation: '',
+    content: payload?.content || '',
+    filename: payload?.filename || '',
+    page: payload?.page ?? null,
+    caption: payload?.caption || '',
+  }
+}
+
+export async function translateLiterature(
+  workspaceId: string,
+  literatureId: string,
+  data: {
+    force?: boolean
+    glossary?: string
+    stream?: boolean
+    signal?: AbortSignal
+    onStart?: (info: {
+      total: number
+      done_count: number
+      resumed: boolean
+      base_markdown: string
+      source_chars: number
+      block_total?: number
+      blocks?: LiteratureTranslationBlock[]
+    }) => void
+    /** index 为文本段序号（表格 / 图片块为 0），block 为该版式块（含表格内容 / 图片信息） */
+    onSegmentStart?: (index: number, total: number, block?: LiteratureTranslationBlock) => void
+    onToken?: (token: string, blockIndex?: number) => void
+    onSegmentDone?: (index: number, total: number, blockIndex?: number) => void
+  } = {},
+): Promise<LiteratureTranslation> {
+  const stream = data.stream !== false
+  const res = await authFetch(
+    `${API_BASE}/workspaces/${workspaceId}/literatures/${literatureId}/translate`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: data.signal,
+      body: JSON.stringify({
+        force: !!data.force,
+        glossary: data.glossary || '',
+        stream,
+      }),
+    },
+  )
+  if (!res.ok) throw new Error(await parseError(res, '启动全文翻译失败'))
+  if (!stream) return res.json()
+
+  const reader = res.body?.getReader()
+  if (!reader) throw new Error('流式响应不可用')
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let translation: LiteratureTranslation | null = null
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const parts = buffer.split('\n\n')
+    buffer = parts.pop() || ''
+    for (const part of parts) {
+      const parsed = parseSseBlock(part.trim())
+      if (!parsed) continue
+      const payload = JSON.parse(parsed.data)
+      if (parsed.event === 'start') {
+        data.onStart?.(payload)
+      } else if (parsed.event === 'segment_start') {
+        data.onSegmentStart?.(
+          Number(payload.index || 0),
+          Number(payload.total || 0),
+          toTranslationBlock(payload),
+        )
+      } else if (parsed.event === 'token') {
+        data.onToken?.(payload.content || '', Number(payload.block_index || 0))
+      } else if (parsed.event === 'segment_done') {
+        data.onSegmentDone?.(
+          Number(payload.index || 0),
+          Number(payload.total || 0),
+          Number(payload.block_index || 0),
+        )
+      } else if (parsed.event === 'done') {
+        translation = payload.translation || null
+      } else if (parsed.event === 'error') {
+        throw new Error(payload.message || '全文翻译失败')
+      }
+    }
+  }
+
+  if (!translation) throw new Error('全文翻译未完成，请重试')
+  return translation
 }
 
 function parseSseBlock(block: string): { event: string; data: string } | null {

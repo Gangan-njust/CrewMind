@@ -44,6 +44,26 @@ def _safe_filename(name: str) -> str:
   return base[:120] or "paper.pdf"
 
 
+def _translation_meta(payload: dict) -> dict:
+  """列表接口只返回译文元信息（全文译文按需单独拉取，避免列表响应过大）"""
+  segments = payload.get("segments") or []
+  markdown_chars = sum(
+    len(str(seg.get("translation") or "").strip()) for seg in segments
+  )
+  return {
+    "status": payload.get("status") or "pending",
+    "target_language": payload.get("target_language") or "zh",
+    "model": payload.get("model") or "",
+    "source_chars": int(payload.get("source_chars") or 0),
+    "translation_chars": markdown_chars,
+    "segment_total": int(payload.get("segment_total") or len(segments)),
+    "segment_done": len([s for s in segments if str(s.get("translation") or "").strip()]),
+    "block_total": int(payload.get("block_total") or len(payload.get("blocks") or [])),
+    "translated_at": payload.get("translated_at"),
+    "error": payload.get("error") or "",
+  }
+
+
 class LiteratureStore:
   def _verify_workspace(self, workspace_id: str, user_id: str) -> None:
     with get_session() as session:
@@ -288,6 +308,18 @@ class LiteratureStore:
       )
       return self._serialize(lit, analysis, index_status)
 
+  def get_translation(self, workspace_id: str, literature_id: str, user_id: str) -> dict:
+    """读取文献「全文英译中」结果（含 markdown 全文与分段译文）"""
+    self._verify_workspace(workspace_id, user_id)
+    with get_session() as session:
+      lit = session.get(LiteratureRecord, literature_id)
+      if not lit or lit.workspace_id != workspace_id:
+        raise ValueError("文献不存在")
+
+    from backend.literature.translator import get_translation_payload
+
+    return get_translation_payload(literature_id)
+
   def get_literatures_by_ids(self, workspace_id: str, literature_ids: list[str]) -> list[dict]:
     with get_session() as session:
       rows = session.scalars(
@@ -408,6 +440,11 @@ class LiteratureStore:
       "uploaded_at": lit.uploaded_at.isoformat(),
       "status": lit.status,
     }
+    translation = _load_json(lit.translation_json, {})
+    if isinstance(translation, dict) and (translation.get("segments") or translation.get("status")):
+      item["translation"] = _translation_meta(translation)
+    else:
+      item["translation"] = None
     if index_status:
       item["index_status"] = {
         "status": index_status.status,

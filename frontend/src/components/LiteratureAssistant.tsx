@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   BookOpen, Plus, Trash2, Upload, Search, CheckSquare, Square,
   Loader, X, Copy, FileText, Sparkles, ChevronRight, Bookmark, Check, PenLine,
-  MessageCircle, RefreshCw,
+  MessageCircle, RefreshCw, Languages, Play, Maximize2, Minimize2,
 } from 'lucide-react'
 import {
   fetchWorkspaces, createWorkspace, updateWorkspace, deleteWorkspace,
@@ -12,10 +12,13 @@ import {
   connectLiteratureWebSocket, startProposalFromLiterature, startLiteratureReviewFromLiterature,
   updateLiteratureAnalysis, fetchAgents, fetchScenarios,
   reindexLiterature, ragQuery, literatureImageUrl,
+  translateLiterature, fetchLiteratureTranslation, literaturePdfUrl,
   type Workspace, type Literature, type AnalysisProgress, type DataSourceMode,
   type Agent, type Scenario, type RagSource, type LiteratureImage,
+  type LiteratureTranslation, type LiteratureTranslationBlock,
 } from '../api'
 import { FormulaBlock } from './FormulaBlock'
+import { WritingMarkdownPreview } from '../WritingMarkdownPreview'
 
 const STATUS_LABELS: Record<string, string> = {
   pending: '待分析',
@@ -31,8 +34,49 @@ const INDEX_STATUS_LABELS: Record<string, string> = {
   failed: '索引失败',
 }
 
+const TRANSLATION_STATUS_LABELS: Record<string, string> = {
+  pending: '未翻译',
+  running: '翻译中',
+  paused: '已暂停，可继续',
+  done: '已翻译',
+  failed: '翻译失败',
+}
+
+const TRANSLATION_GLOSSARY_PLACEHOLDER = [
+  '每行一个术语，格式：英文=中文，例如',
+  'attention=注意力机制',
+  'ablation study=消融实验',
+].join('\n')
+
 const PROPOSAL_SCENARIO_ID = 'literature_based_proposal'
 const LITERATURE_REVIEW_SCENARIO_ID = 'literature_based_review'
+
+/** 新增 / 更新一个版式块（保留已流式写入的译文，避免被事件覆盖） */
+function upsertTranslationBlock(
+  list: LiteratureTranslationBlock[],
+  block: LiteratureTranslationBlock,
+): LiteratureTranslationBlock[] {
+  const index = list.findIndex(item => item.index === block.index)
+  if (index < 0) {
+    return [...list, block].sort((a, b) => a.index - b.index)
+  }
+  const next = [...list]
+  next[index] = { ...next[index], ...block, translation: next[index].translation }
+  return next
+}
+
+/** 把流式 token 追加到对应版式块的译文（文本块） */
+function appendTranslationBlockText(
+  list: LiteratureTranslationBlock[],
+  blockIndex: number,
+  token: string,
+): LiteratureTranslationBlock[] {
+  const index = list.findIndex(item => item.index === blockIndex)
+  if (index < 0) return list
+  const next = [...list]
+  next[index] = { ...next[index], translation: `${next[index].translation}${token}` }
+  return next
+}
 
 function defaultScenarioAgents(scenario: Scenario | null, agents: Agent[]): string[] {
   if (!scenario) return []
@@ -89,8 +133,23 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
   const [ragSources, setRagSources] = useState<RagSource[]>([])
   const [ragLoading, setRagLoading] = useState(false)
   const [reindexingId, setReindexingId] = useState<string | null>(null)
+  const [detailTab, setDetailTab] = useState<'analysis' | 'translation'>('analysis')
+  const [translation, setTranslation] = useState<LiteratureTranslation | null>(null)
+  const [translationBlocks, setTranslationBlocks] = useState<LiteratureTranslationBlock[]>([])
+  const [translationText, setTranslationText] = useState('')
+  const [translationLoading, setTranslationLoading] = useState(false)
+  const [translationError, setTranslationError] = useState('')
+  const [translationProgress, setTranslationProgress] = useState<{ index: number; total: number } | null>(null)
+  const [translationGlossary, setTranslationGlossary] = useState('')
+  const [translationView, setTranslationView] = useState<'translated' | 'compare'>('translated')
+  const [compareOriginal, setCompareOriginal] = useState<'pdf' | 'text'>('pdf')
+  const [compareFullscreen, setCompareFullscreen] = useState(false)
+  const [showGlossary, setShowGlossary] = useState(false)
+  const [autoTranslate, setAutoTranslate] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
   const wsRef = useRef<WebSocket | null>(null)
+  const translateAbortRef = useRef<AbortController | null>(null)
+  const autoTranslateStartedRef = useRef(false)
   const toastTimer = useRef<ReturnType<typeof setTimeout>>()
 
   const showToast = useCallback((msg: string) => {
@@ -168,10 +227,61 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
     if (updated) setDetailLit(updated)
   }, [literatures]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // 打开文献详情时加载已保存的全文译文（列表接口只返回译文元信息）
+  useEffect(() => {
+    const target = detailLit
+    setTranslation(null)
+    setTranslationBlocks([])
+    setTranslationText('')
+    setTranslationError('')
+    setTranslationProgress(null)
+    setCompareFullscreen(false)
+    if (!target || !activeWorkspace) return
+    if (!target.translation?.status) return
+
+    let cancelled = false
+    let attachedToBackgroundRun = false
+    setTranslationLoading(true)
+    fetchLiteratureTranslation(activeWorkspace.id, target.id)
+      .then(data => {
+        if (cancelled) return
+        setTranslation(data)
+        setTranslationBlocks(data.blocks || [])
+        setTranslationText(data.markdown || '')
+        if (data.status === 'running') {
+          // 翻译在后台继续执行：自动重新接入事件流，继续显示实时进度
+          attachedToBackgroundRun = true
+          handleTranslate(target, { force: false })
+        }
+      })
+      .catch((e: any) => {
+        if (!cancelled) setTranslationError(e.message || '获取全文翻译失败')
+      })
+      .finally(() => {
+        if (!cancelled && !attachedToBackgroundRun) setTranslationLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+      translateAbortRef.current?.abort()
+      translateAbortRef.current = null
+    }
+  }, [detailLit?.id]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 从列表「全文翻译」入口打开详情时自动开始翻译（此时尚无任何译文）
+  useEffect(() => {
+    if (!autoTranslate || !detailLit) return
+    if (autoTranslateStartedRef.current) return
+    autoTranslateStartedRef.current = true
+    setAutoTranslate(false)
+    if (!detailLit.translation?.status) handleTranslate(detailLit, { force: false })
+  }, [autoTranslate, detailLit]) // eslint-disable-line react-hooks/exhaustive-deps
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        if (lightboxSrc) setLightboxSrc(null)
+        if (compareFullscreen) setCompareFullscreen(false)
+        else if (lightboxSrc) setLightboxSrc(null)
         else if (detailLit) setDetailLit(null)
         else if (showProposal) setShowProposal(false)
         else if (showReview) setShowReview(false)
@@ -180,7 +290,7 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
     }
     document.addEventListener('keydown', handleKeyDown)
     return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [lightboxSrc, detailLit, showProposal, showReview, showCreateWs])
+  }, [compareFullscreen, lightboxSrc, detailLit, showProposal, showReview, showCreateWs])
 
   const handleCreateWorkspace = async () => {
     if (!wsForm.name.trim()) return
@@ -368,6 +478,78 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
     }
   }
 
+  const handleTranslate = async (lit: Literature, opts?: { force?: boolean }) => {
+    if (!activeWorkspace) return
+    translateAbortRef.current?.abort()
+    const controller = new AbortController()
+    translateAbortRef.current = controller
+    setTranslationLoading(true)
+    setTranslationError('')
+    setTranslationProgress(null)
+    setTranslationBlocks([])
+    try {
+      const result = await translateLiterature(activeWorkspace.id, lit.id, {
+        force: !!opts?.force,
+        glossary: translationGlossary.trim(),
+        stream: true,
+        signal: controller.signal,
+        onStart: info => {
+          setTranslationText(info.base_markdown || '')
+          setTranslationBlocks(info.blocks || [])
+          setTranslationProgress({ index: info.done_count, total: info.total })
+        },
+        onSegmentStart: (index, total, block) => {
+          setTranslationProgress({ index: index > 0 ? index - 1 : 0, total })
+          if (!block) return
+          setTranslationBlocks(prev => upsertTranslationBlock(prev, block))
+          // 表格块不翻译：直接按原文把表格内容并入译文文本（复制/导出保持完整）
+          if (block.kind === 'table' && block.content) {
+            setTranslationText(prev => `${prev}${prev ? '\n\n' : ''}${block.content}`)
+          }
+        },
+        onToken: (token, blockIndex) => {
+          setTranslationText(prev => prev + token)
+          if (blockIndex) {
+            setTranslationBlocks(prev => appendTranslationBlockText(prev, blockIndex, token))
+          }
+        },
+        onSegmentDone: (index, total) => {
+          setTranslationProgress({ index, total })
+          if (index > 0 && index < total) setTranslationText(prev => `${prev}\n\n`)
+        },
+      })
+      setTranslation(result)
+      setTranslationBlocks(result.blocks || [])
+      setTranslationText(result.markdown || '')
+      showToast('全文翻译完成')
+      await loadLiteratures(activeWorkspace.id, debouncedKeyword || undefined)
+    } catch (e: any) {
+      if (e?.name === 'AbortError') {
+        // 断开连接不再中断翻译：后台任务会继续译完，回来可再次接入查看
+        showToast('翻译已在后台继续，可稍后回来查看进度')
+        // 刷新列表，同步「已译 x/y 段」进度（便于显示「继续翻译」）
+        await loadLiteratures(activeWorkspace.id, debouncedKeyword || undefined)
+      } else {
+        setTranslationError(e?.message || '全文翻译失败')
+      }
+    } finally {
+      setTranslationLoading(false)
+      setTranslationProgress(null)
+      autoTranslateStartedRef.current = false
+    }
+  }
+
+  const openDetail = (lit: Literature) => {
+    setDetailTab('analysis')
+    setDetailLit(lit)
+  }
+
+  const openTranslation = (lit: Literature) => {
+    setDetailTab('translation')
+    setDetailLit(lit)
+    if (!lit.translation?.status) setAutoTranslate(true)
+  }
+
   const handleRagQuery = async () => {
     if (!activeWorkspace || !ragQuestion.trim()) return
     setRagLoading(true)
@@ -392,7 +574,7 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
 
   const openSourceLiterature = (source: RagSource) => {
     const lit = literatures.find(l => l.id === source.literature_id)
-    if (lit) setDetailLit(lit)
+    if (lit) openDetail(lit)
   }
 
   const openProposalModal = async () => {
@@ -464,6 +646,394 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
             </figcaption>
           </figure>
         ))}
+      </div>
+    )
+  }
+
+  const renderTranslationFigure = (lit: Literature, block: LiteratureTranslationBlock) => {
+    if (!block.filename) {
+      // 图注存在但未提取到原图：保留占位块，避免图表静默缺失
+      return (
+        <div className="literature-translation-figure-placeholder">
+          <span className="literature-translation-figure-badge">
+            {block.number ? `图 ${block.number}` : '插图'}
+          </span>
+          <p>{block.caption || `原文第 ${block.page || '?'} 页图`}</p>
+          <p className="text-muted">原图未提取（可能为矢量图或提取失败），请对照原 PDF 查看。</p>
+        </div>
+      )
+    }
+    const src = literatureImageUrl(activeWorkspace?.id || '', lit.id, block.filename)
+    return (
+      <figure className="literature-translation-figure">
+        <button
+          type="button"
+          className="literature-translation-figure-open"
+          title="点击查看大图"
+          onClick={() => setLightboxSrc(src)}
+        >
+          <img
+            src={src}
+            alt={block.caption || `文献第 ${block.page || '?'} 页图片`}
+            loading="lazy"
+          />
+        </button>
+        <figcaption>
+          {block.caption || `原文第 ${block.page || '?'} 页图片`}
+          {block.page ? <span className="literature-inline-page"> · 第 {block.page} 页</span> : null}
+        </figcaption>
+      </figure>
+    )
+  }
+
+  const renderTranslationTable = (block: LiteratureTranslationBlock) => (
+    <div className="literature-translation-table">
+      {block.number ? (
+        <div className="literature-translation-block-label">表 {block.number}（原样保留）</div>
+      ) : null}
+      <WritingMarkdownPreview content={block.content || ''} />
+    </div>
+  )
+
+  /** 仅译文视图：文本块（翻译）+ 表格块（原样）+ 图片块（原图） */
+  const renderTranslationBlocks = (lit: Literature, blocks: LiteratureTranslationBlock[]) => (
+    <div className="literature-translation-body fade-in">
+      {blocks.map(block => {
+        if (block.kind === 'figure') {
+          return (
+            <div key={`figure-${block.index}`} className="literature-translation-block">
+              {renderTranslationFigure(lit, block)}
+            </div>
+          )
+        }
+        if (block.kind === 'table') {
+          if (!block.content) return null
+          return (
+            <div key={`table-${block.index}`}>
+              {renderTranslationTable(block)}
+            </div>
+          )
+        }
+        if (block.kind === 'reference') {
+          if (!block.content) return null
+          return (
+            <div key={`reference-${block.index}`} className="literature-translation-reference">
+              <div className="literature-translation-reference-title">参考文献（保留原文，不翻译）</div>
+              <pre className="literature-translation-reference-body">{block.content}</pre>
+            </div>
+          )
+        }
+        if (block.role === 'caption') {
+          const original = (block.content || '').trim()
+          const translated = (block.translation || '').trim()
+          if (!original && !translated) return null
+          return (
+            <div key={`caption-${block.index}`} className="literature-translation-caption">
+              {original ? (
+                <p className="literature-translation-caption-source">{original}</p>
+              ) : null}
+              {translated ? (
+                <div className="literature-translation-caption-translation">
+                  <WritingMarkdownPreview content={translated} />
+                </div>
+              ) : null}
+            </div>
+          )
+        }
+        if (!block.translation.trim()) return null
+        return (
+          <div key={`text-${block.index}`} className="literature-translation-block">
+            <WritingMarkdownPreview content={block.translation} />
+          </div>
+        )
+      })}
+    </div>
+  )
+
+  /** 对照阅读视图：左栏原文（默认按原格式内嵌 PDF）/ 右栏译文，支持全屏切换 */
+  const renderTranslationCompare = (lit: Literature, blocks: LiteratureTranslationBlock[]) => {
+    const pdfUrl = lit.pdf_path ? literaturePdfUrl(activeWorkspace?.id || '', lit.id) : ''
+    const usePdf = compareOriginal === 'pdf' && !!pdfUrl
+
+    const renderRows = () => blocks.map(block => {
+      if (block.kind === 'figure') {
+        return (
+          <div
+            key={`cmp-figure-${block.index}`}
+            className="literature-compare-row literature-compare-row-wide"
+          >
+            {renderTranslationFigure(lit, block)}
+          </div>
+        )
+      }
+      if (block.kind === 'table') {
+        if (!block.content) return null
+        return (
+          <div
+            key={`cmp-table-${block.index}`}
+            className="literature-compare-row literature-compare-row-wide"
+          >
+            {renderTranslationTable(block)}
+          </div>
+        )
+      }
+      if (block.kind === 'reference') {
+        if (!block.content) return null
+        return (
+          <div
+            key={`cmp-reference-${block.index}`}
+            className="literature-compare-row literature-compare-row-wide"
+          >
+            <div className="literature-translation-reference">
+              <div className="literature-translation-reference-title">参考文献（保留原文，不翻译）</div>
+              <pre className="literature-translation-reference-body">{block.content}</pre>
+            </div>
+          </div>
+        )
+      }
+      const isCaption = block.role === 'caption'
+      const original = (isCaption ? block.content : block.source) || ''
+      const translated = block.translation || ''
+      return (
+        <div
+          key={`cmp-${block.index}`}
+          className={`literature-compare-row${isCaption ? ' literature-compare-row-caption' : ''}`}
+        >
+          <div className="literature-compare-col literature-compare-source">
+            {original.trim()
+              ? <WritingMarkdownPreview content={original} />
+              : <p className="text-muted">（原文未保存，点「重新翻译整篇」后可对照阅读）</p>}
+          </div>
+          <div className="literature-compare-col literature-compare-target">
+            {translated.trim()
+              ? <WritingMarkdownPreview content={translated} />
+              : <p className="text-muted">（本段尚未翻译）</p>}
+          </div>
+        </div>
+      )
+    })
+
+    return (
+      <div className={`literature-compare-panel${compareFullscreen ? ' literature-compare-panel-fullscreen' : ''}`}>
+        <div className="literature-compare-toolbar">
+          <span className="literature-compare-toolbar-title">
+            对照阅读 · {usePdf ? '原文 PDF（保持原格式）' : '原文文本'}
+          </span>
+          <div className="literature-compare-toolbar-actions">
+            {pdfUrl ? (
+              <button
+                type="button"
+                className="btn btn-outline btn-sm"
+                onClick={() => setCompareOriginal(usePdf ? 'text' : 'pdf')}
+              >
+                {usePdf ? '切换原文文本' : '切换原文 PDF'}
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="btn btn-outline btn-sm"
+              onClick={() => setCompareFullscreen(v => !v)}
+            >
+              {compareFullscreen
+                ? <><Minimize2 size={14} /> 退出全屏</>
+                : <><Maximize2 size={14} /> 全屏对照</>}
+            </button>
+          </div>
+        </div>
+
+        {usePdf ? (
+          <div className="literature-compare-split">
+            <div className="literature-compare-pane">
+              <iframe
+                className="literature-compare-pdf"
+                src={`${pdfUrl}#view=FitH`}
+                title="原文 PDF"
+              />
+            </div>
+            <div className="literature-compare-pane literature-compare-pane-scroll">
+              {renderTranslationBlocks(lit, blocks)}
+            </div>
+          </div>
+        ) : (
+          <div className="literature-compare-text">
+            <div className="literature-compare-head">
+              <span>原文（English）</span>
+              <span>译文（中文）</span>
+            </div>
+            {renderRows()}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  const renderTranslation = (lit: Literature) => {
+    const meta = translation || lit.translation
+    const status = translationLoading ? 'running' : (meta?.status || 'pending')
+    const total = meta?.segment_total || 0
+    const doneSegments = translationProgress?.index ?? meta?.segment_done ?? 0
+    const pct = total ? Math.min(100, Math.round((doneSegments / total) * 100)) : 0
+    const hasText = translationText.trim().length > 0
+    const finished = meta?.status === 'done'
+    const partial = !finished && (meta?.segment_done || 0) > 0
+    // 版式块：文本 / 表格 / 图片；旧译文（无 blocks）回退按 markdown 展示
+    const blocks = translationBlocks.length ? translationBlocks : (translation?.blocks || [])
+    const hasBlocks = blocks.length > 0
+    const figureCount = blocks.filter(b => b.kind === 'figure').length
+    const tableCount = blocks.filter(b => b.kind === 'table').length
+    const legacyWithoutLayout = !hasBlocks && finished && (lit.analysis?.images?.length || 0) > 0
+    const statusCls = finished
+      ? 'status-done'
+      : status === 'failed'
+        ? 'status-failed'
+        : status === 'running' || status === 'paused'
+          ? 'status-running'
+          : 'status-pending'
+
+    return (
+      <div className="literature-translation">
+        <div className="literature-translation-toolbar">
+          <div className="literature-translation-meta">
+            <span className={`status-tag ${statusCls}`}>{TRANSLATION_STATUS_LABELS[status] || status}</span>
+            {meta?.translated_at && (
+              <span className="text-muted">最近翻译：{meta.translated_at.replace('T', ' ')}</span>
+            )}
+            {total > 0 && <span className="text-muted">共 {total} 段 / 已译 {doneSegments} 段</span>}
+            {(figureCount > 0 || tableCount > 0) && (
+              <span className="text-muted">
+                图表 {figureCount} 张 · 表格 {tableCount} 个（位置与数据保持原样）
+              </span>
+            )}
+            {hasText && <span className="text-muted">译文 {translationText.length} 字</span>}
+          </div>
+          <div className="literature-translation-actions">
+            <button
+              type="button"
+              className={`btn btn-outline btn-sm${translationView === 'translated' ? ' btn-copied' : ''}`}
+              onClick={() => setTranslationView('translated')}
+            >
+              仅译文
+            </button>
+            <button
+              type="button"
+              className={`btn btn-outline btn-sm${translationView === 'compare' ? ' btn-copied' : ''}`}
+              onClick={() => setTranslationView('compare')}
+            >
+              对照阅读
+            </button>
+            <button
+              type="button"
+              className={`btn btn-outline btn-sm${showGlossary ? ' btn-copied' : ''}`}
+              onClick={() => setShowGlossary(v => !v)}
+            >
+              <Bookmark size={14} /> 术语表
+            </button>
+            <button
+              type="button"
+              className="btn btn-outline btn-sm"
+              disabled={!hasText}
+              onClick={() => copyText(translationText)}
+            >
+              <Copy size={14} /> 复制译文
+            </button>
+            <button
+              type="button"
+              className="btn btn-primary btn-sm"
+              disabled={translationLoading}
+              onClick={() => handleTranslate(lit, { force: finished })}
+            >
+              {translationLoading ? (
+                <><Loader size={14} className="spinner" /> 翻译中…</>
+              ) : finished ? (
+                <><RefreshCw size={14} /> 重新翻译整篇</>
+              ) : status === 'running' ? (
+                <><Play size={14} /> 接入后台翻译</>
+              ) : (
+                <><Play size={14} /> {partial ? '继续翻译' : '翻译整篇文献'}</>
+              )}
+            </button>
+          </div>
+        </div>
+
+        {showGlossary && (
+          <div className="literature-translation-glossary">
+            <label className="form-label">专业术语表（可选，用于全篇统一译名）</label>
+            <textarea
+              className="form-textarea"
+              rows={4}
+              placeholder={TRANSLATION_GLOSSARY_PLACEHOLDER}
+              value={translationGlossary}
+              onChange={e => setTranslationGlossary(e.target.value)}
+            />
+            <p className="form-hint">
+              每行「英文=中文」。术语表随提示词下发，确保全篇译名一致；修改后请重新翻译整篇。
+            </p>
+          </div>
+        )}
+
+        {translationLoading && (
+          <div className="literature-translation-progress">
+            <div className="analysis-progress-bar">
+              <div className="analysis-progress-fill" style={{ width: `${pct}%` }} />
+            </div>
+            <span>
+              {translationProgress
+                ? `正在翻译第 ${Math.max(1, translationProgress.index)}/${translationProgress.total} 段…`
+                : '正在准备翻译…'}
+            </span>
+          </div>
+        )}
+
+        {!translationLoading && status === 'running' && (
+          <div className="literature-translation-progress">
+            <span>
+              翻译正在后台继续（关闭文献助手也不会中断），点击「接入后台翻译」可查看实时进度。
+            </span>
+          </div>
+        )}
+
+        {translationError && <div className="error-banner">{translationError}</div>}
+
+        {(() => {
+          const notices = [
+            ...(meta?.warnings || []),
+            ...(meta?.number_checks || []),
+          ]
+          if (!notices.length) return null
+          return (
+            <div className="literature-translation-warnings">
+              <div className="literature-translation-warnings-title">图表完整性 / 译文核对</div>
+              {notices.map((notice, i) => (
+                <p key={i} className="literature-translation-warning">{notice}</p>
+              ))}
+            </div>
+          )
+        })()}
+
+        {legacyWithoutLayout && (
+          <p className="form-hint">
+            该译文由旧版保存，尚未包含内联图表。点击「重新翻译整篇」后，文中图表将按原文位置显示、表格原样保留。
+          </p>
+        )}
+
+        {hasBlocks ? (
+          translationView === 'compare'
+            ? renderTranslationCompare(lit, blocks)
+            : renderTranslationBlocks(lit, blocks)
+        ) : hasText ? (
+          <div className="literature-translation-body fade-in">
+            <WritingMarkdownPreview content={translationText} />
+          </div>
+        ) : (
+          <div className="empty-state literature-translation-empty">
+            <Languages size={40} color="var(--text-muted)" />
+            <p>尚未翻译。点击「翻译整篇文献」将按原文分段进行英译中，译文自动保存，可随时中断后继续。</p>
+            <p className="text-muted">
+              翻译遵循学术规范：术语全篇统一、缩写首现给出中英全称、公式与引用编号保持原样；
+              图表按原文位置内联显示，表格格式与数据原样保留。
+            </p>
+          </div>
+        )}
       </div>
     )
   }
@@ -713,7 +1283,26 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
             </span>
           </div>
           <div className="analysis-view-body card">
-            {renderAnalysisDetail(detailLit)}
+            <div className="literature-detail-tabs">
+              <button
+                type="button"
+                className={`literature-detail-tab${detailTab === 'analysis' ? ' active' : ''}`}
+                onClick={() => setDetailTab('analysis')}
+              >
+                <FileText size={14} /> AI 分析
+              </button>
+              <button
+                type="button"
+                className={`literature-detail-tab${detailTab === 'translation' ? ' active' : ''}`}
+                onClick={() => setDetailTab('translation')}
+              >
+                <Languages size={14} /> 全文翻译（英译中）
+                {detailLit.translation?.status === 'done' && <span className="literature-detail-tab-dot" />}
+              </button>
+            </div>
+            {detailTab === 'analysis'
+              ? renderAnalysisDetail(detailLit)
+              : renderTranslation(detailLit)}
           </div>
         </div>
       ) : (
@@ -895,7 +1484,7 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
                         <input type="checkbox" checked={checkedIds.has(lit.id)}
                           onChange={() => toggleCheck(lit.id)} />
                       </td>
-                      <td className="title-cell" onClick={() => setDetailLit(lit)}>{lit.title}</td>
+                      <td className="title-cell" onClick={() => openDetail(lit)}>{lit.title}</td>
                       <td>{lit.authors.slice(0, 2).join(', ')}{lit.authors.length > 2 ? ' 等' : ''}</td>
                       <td>{lit.journal || '—'}</td>
                       <td>{lit.year || '—'}</td>
@@ -924,9 +1513,18 @@ export function LiteratureAssistant({ onStartWorkflow, onStartWriting }: Props) 
                         <button
                           className="btn btn-sm btn-outline"
                           title="查看分析结构"
-                          onClick={() => setDetailLit(lit)}
+                          onClick={() => openDetail(lit)}
                         >
                           <FileText size={14} />
+                        </button>
+                        <button
+                          className={`btn btn-sm btn-outline${lit.translation?.status === 'done' ? ' btn-copied' : ''}`}
+                          title={lit.translation?.status === 'done'
+                            ? '查看全文翻译（英译中）'
+                            : '翻译整篇文献（英译中）'}
+                          onClick={() => openTranslation(lit)}
+                        >
+                          <Languages size={14} />
                         </button>
                         <button className="btn btn-sm btn-danger" onClick={async () => {
                           if (confirm('确定删除？')) {

@@ -1,5 +1,6 @@
 """智能文献阅读助手 API 路由"""
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -108,6 +109,16 @@ class RagQueryRequest(BaseModel):
   stream: bool = False
 
 
+class TranslateRequest(BaseModel):
+  force: bool = Field(False, description="为 True 时忽略已有译文，整篇重新翻译")
+  stream: bool = Field(True, description="为 True 时以 SSE 流式返回译文")
+  glossary: str = Field(
+    "",
+    max_length=4000,
+    description="可选术语表，每行「英文=中文」，用于统一专业术语译名",
+  )
+
+
 class LiteratureConnectionManager:
   def __init__(self):
     self.active: dict[str, list[WebSocket]] = {}
@@ -136,6 +147,26 @@ async def _broadcast_progress(workspace_id: str, progress: dict):
     "type": "literature_analysis_progress",
     **progress,
   })
+
+
+def _sse(event: str, data: dict) -> str:
+  return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+async def _translation_sse_stream(events):
+  """把翻译事件流转为 SSE：start / segment_start / token / segment_done / done / error
+
+  表格块与图片块不调用大模型，其事件携带 kind / content / filename / page / caption，
+  前端据此在译文页按原文位置渲染表格与图表。"""
+  try:
+    async for event in events:
+      payload = {k: v for k, v in event.items() if k != "event"}
+      yield _sse(str(event.get("event") or "message"), payload)
+  except ValueError as e:
+    yield _sse("error", {"message": str(e)})
+  except Exception as e:
+    logger.exception("文献翻译流式输出失败")
+    yield _sse("error", {"message": str(e) or "翻译失败"})
 
 
 # ── 工作空间 API ──────────────────────────────────────────────
@@ -464,6 +495,45 @@ async def get_literature_image(
   return FileResponse(str(image_path))
 
 
+@router.get("/workspaces/{workspace_id}/literatures/{literature_id}/pdf")
+async def get_literature_pdf(
+  workspace_id: str,
+  literature_id: str,
+  token: str = Query(""),
+):
+  """返回文献原始 PDF（inline），供「对照阅读」左栏按原格式展示。
+
+  通过 token 查询参数鉴权（与图片接口一致），使 <iframe> 可直接内嵌展示。
+  """
+  if not token:
+    raise HTTPException(401, "未登录")
+  try:
+    payload = decode_token(token)
+    user = get_user_by_id(payload.get("sub", ""))
+    if not user:
+      raise HTTPException(401, "用户不存在")
+  except HTTPException:
+    raise HTTPException(401, "登录已过期")
+
+  try:
+    item = literature_store.get_literature(workspace_id, literature_id, user.id)
+  except ValueError as e:
+    raise HTTPException(404, str(e))
+
+  from backend.literature.parser import resolve_pdf_path
+
+  pdf_path = str(item.get("pdf_path") or "")
+  path = resolve_pdf_path(pdf_path) if pdf_path else None
+  if path is None or not path.exists() or not path.is_file():
+    raise HTTPException(404, "PDF 不存在")
+
+  return FileResponse(
+    str(path),
+    media_type="application/pdf",
+    headers={"Content-Disposition": 'inline; filename="literature.pdf"'},
+  )
+
+
 @router.get("/workspaces/{workspace_id}/literatures/{literature_id}/analysis")
 async def get_literature_analysis(
   workspace_id: str,
@@ -622,6 +692,65 @@ async def rag_query_api(
     )
   except ValueError as e:
     raise HTTPException(400, str(e))
+
+
+# ── 文献全文英译中 ────────────────────────────────────────────
+
+@router.post("/workspaces/{workspace_id}/literatures/{literature_id}/translate")
+async def translate_literature_api(
+  workspace_id: str,
+  literature_id: str,
+  req: TranslateRequest | None = None,
+  current_user: User = Depends(get_current_user),
+):
+  """整篇文献英译中（stream=True 时以 SSE 流式返回译文片段）"""
+  try:
+    literature_store.get_literature(workspace_id, literature_id, current_user.id)
+  except ValueError as e:
+    raise HTTPException(404, str(e))
+
+  from backend.literature.translator import start_translation_run, translate_literature
+
+  options = req or TranslateRequest()
+  set_llm_run_context(user_id=current_user.id, run_id=workspace_id, source="literature")
+
+  if options.stream:
+    # 翻译在后台任务中执行：客户端断线（退出文献助手）不会中断翻译，
+    # 重新打开页面时再次调用本接口即可重新接入事件流查看实时进度。
+    run = await start_translation_run(
+      literature_id,
+      glossary=options.glossary,
+      force=options.force,
+    )
+    return StreamingResponse(
+      _translation_sse_stream(run.subscribe()),
+      media_type="text/event-stream",
+      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+  try:
+    return await translate_literature(
+      literature_id,
+      glossary=options.glossary,
+      force=options.force,
+    )
+  except ValueError as e:
+    raise HTTPException(400, str(e))
+
+
+@router.get("/workspaces/{workspace_id}/literatures/{literature_id}/translation")
+async def get_literature_translation_api(
+  workspace_id: str,
+  literature_id: str,
+  current_user: User = Depends(get_current_user),
+):
+  """读取文献已保存的全文译文"""
+  try:
+    return literature_store.get_translation(workspace_id, literature_id, current_user.id)
+  except ValueError as e:
+    raise HTTPException(404, str(e))
+
+
 
 
 @router.post("/workspaces/{workspace_id}/selections/save")
@@ -808,7 +937,6 @@ def register_literature_websocket(app):
         **get_analysis_progress(workspace_id),
       })
       while True:
-        import json
         data = await websocket.receive_text()
         msg = json.loads(data)
         if msg.get("type") == "ping":

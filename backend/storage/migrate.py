@@ -103,6 +103,14 @@ def run_migrations(engine) -> None:
       LiteratureRecord.__table__.create(bind=conn)
       logger.info("已创建 literatures 表")
 
+    if _table_exists(inspector, "literatures") and not _column_exists(
+      inspector, "literatures", "translation_json"
+    ):
+      conn.execute(
+        text("ALTER TABLE literatures ADD COLUMN translation_json TEXT DEFAULT '{}'")
+      )
+      logger.info("已为 literatures 添加 translation_json 列")
+
     if not _table_exists(inspector, "literature_analysis"):
       LiteratureAnalysisRecord.__table__.create(bind=conn)
       logger.info("已创建 literature_analysis 表")

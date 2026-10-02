@@ -2458,6 +2458,213 @@ body {
   line-height: 1.5;
 }
 
+/* 文献详情：AI 分析 / 全文翻译 切换 */
+.literature-detail-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 20px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.literature-detail-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.literature-detail-tab:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+.literature-detail-tab.active {
+  background: var(--accent-bg);
+  border-color: var(--accent);
+  color: var(--accent-light);
+  font-weight: 600;
+}
+
+.literature-detail-tab-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+}
+
+/* 全文翻译（英译中） */
+.literature-translation {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.literature-translation-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.literature-translation-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.literature-translation-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.literature-translation-glossary {
+  padding: 12px 14px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: var(--bg-hover);
+}
+
+.literature-translation-glossary .form-textarea {
+  width: 100%;
+  resize: vertical;
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 13px;
+}
+
+.literature-translation-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.literature-translation-progress .analysis-progress-bar {
+  flex: 1;
+}
+
+.literature-translation-body {
+  padding: 4px 2px 8px;
+  font-size: 15px;
+  line-height: 1.9;
+  color: var(--text-primary);
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.literature-translation-body h1,
+.literature-translation-body h2,
+.literature-translation-body h3,
+.literature-translation-body h4 {
+  font-size: 15px;
+  color: var(--accent-light);
+  margin: 18px 0 8px;
+}
+
+.literature-translation-body p {
+  margin-bottom: 12px;
+}
+
+/* 译文版式块：按原文顺序排列（文本 / 表格 / 图片） */
+.literature-translation-block > :last-child {
+  margin-bottom: 0;
+}
+
+/* 译文中按原文位置内联的图表 */
+.literature-translation-figure {
+  margin: 18px auto;
+  max-width: 640px;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--bg-primary);
+  display: flex;
+  flex-direction: column;
+}
+
+.literature-translation-figure-open {
+  display: block;
+  padding: 10px;
+  border: none;
+  background: none;
+  cursor: zoom-in;
+}
+
+.literature-translation-figure img {
+  display: block;
+  width: 100%;
+  max-height: 460px;
+  object-fit: contain;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.literature-translation-figure figcaption {
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  border-top: 1px solid var(--border);
+  background: var(--bg-card);
+  text-align: center;
+}
+
+/* 原样保留的表格：等宽显示，保证列对齐与数据不丢失 */
+.literature-translation-table pre {
+  overflow-x: auto;
+  margin: 12px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-hover);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.literature-translation-table table {
+  width: 100%;
+  margin: 12px 0;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.literature-translation-table th,
+.literature-translation-table td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.literature-translation-table th {
+  background: var(--bg-hover);
+}
+
+.literature-translation-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  text-align: center;
+}
+
+.literature-translation-empty p {
+  max-width: 620px;
+}
+
 /* 分析结果全屏视图 */
 .literature-analysis-view {
   display: flex;
@@ -7571,3 +7778,289 @@ button.writing-subheading-tree-item.active {
 }
 
 
+
+
+/* 译文题注块：原文原样保留 + 中文译注紧随其后 */
+.literature-translation-caption {
+  margin: 12px 0;
+  padding: 8px 12px;
+  border-left: 3px solid var(--accent);
+  background: var(--bg-hover);
+  border-radius: 0 8px 8px 0;
+}
+
+.literature-translation-caption-source {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.literature-translation-caption-translation {
+  margin-top: 6px;
+  font-size: 14px;
+  line-height: 1.8;
+  color: var(--text-primary);
+}
+
+.literature-translation-caption-translation > :last-child {
+  margin-bottom: 0;
+}
+
+/* 未提取到原图的图注占位块 */
+.literature-translation-figure-placeholder {
+  margin: 18px auto;
+  max-width: 640px;
+  padding: 14px 16px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  background: var(--bg-card);
+  text-align: center;
+}
+
+.literature-translation-figure-placeholder p {
+  margin: 6px 0 0;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.literature-translation-figure-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--accent-light);
+  background: var(--bg-hover);
+}
+
+.literature-translation-block-label {
+  margin: 12px 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-light);
+}
+
+/* 图表完整性与译文核对告警 */
+.literature-translation-warnings {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-hover);
+}
+
+.literature-translation-warnings-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.literature-translation-warning {
+  margin: 2px 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+}
+
+
+/* 对照阅读：左列原文 / 右列译文，按块一一对齐 */
+.literature-translation-compare {
+  margin-top: 8px;
+  max-height: 70vh;
+  overflow-y: auto;
+  font-size: 14px;
+  line-height: 1.85;
+  color: var(--text-primary);
+}
+
+.literature-compare-head {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 6px 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--bg-primary);
+  border-bottom: 1px solid var(--border);
+}
+
+.literature-compare-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  padding: 10px 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.literature-compare-row-wide {
+  grid-template-columns: 1fr;
+  justify-items: center;
+}
+
+.literature-compare-row-caption {
+  background: var(--bg-hover);
+}
+
+.literature-compare-col {
+  min-width: 0;
+}
+
+.literature-compare-col > :last-child {
+  margin-bottom: 0;
+}
+
+.literature-compare-source {
+  padding-right: 14px;
+  border-right: 1px dashed var(--border);
+  color: var(--text-secondary);
+}
+
+.literature-compare-target {
+  color: var(--text-primary);
+}
+
+@media (max-width: 900px) {
+  .literature-compare-head {
+    display: none;
+  }
+
+  .literature-compare-row {
+    grid-template-columns: 1fr;
+  }
+
+  .literature-compare-source {
+    padding-right: 0;
+    border-right: none;
+    border-bottom: 1px dashed var(--border);
+    padding-bottom: 8px;
+  }
+}
+
+
+/* 参考文献区：原样保留、不翻译 */
+.literature-translation-reference {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-hover);
+}
+
+.literature-translation-reference-title {
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.literature-translation-reference-body {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.75;
+  color: var(--text-secondary);
+}
+
+
+/* 对照阅读面板：原文（PDF 原格式 / 文本）与译文并排，支持全屏 */
+.literature-compare-panel {
+  margin-top: 8px;
+}
+
+.literature-compare-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 2px 8px;
+  flex-wrap: wrap;
+}
+
+.literature-compare-toolbar-title {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.literature-compare-toolbar-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.literature-compare-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  height: 70vh;
+}
+
+.literature-compare-pane {
+  min-width: 0;
+  height: 100%;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-primary);
+}
+
+.literature-compare-pane-scroll {
+  overflow-y: auto;
+  padding: 8px 12px;
+}
+
+.literature-compare-pane .literature-translation-body {
+  max-height: none;
+}
+
+.literature-compare-pdf {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: none;
+}
+
+.literature-compare-text {
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+/* 全屏：覆盖整页，Esc 或「退出全屏」返回 */
+.literature-compare-panel-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  flex-direction: column;
+  padding: 14px 18px;
+  background: var(--bg-primary);
+}
+
+.literature-compare-panel-fullscreen .literature-compare-split {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+}
+
+.literature-compare-panel-fullscreen .literature-compare-text {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+
+@media (max-width: 900px) {
+  .literature-compare-split {
+    grid-template-columns: 1fr;
+    height: auto;
+  }
+
+  .literature-compare-pane {
+    height: 60vh;
+  }
+}
